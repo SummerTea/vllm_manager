@@ -7,6 +7,7 @@ vLLM 推理服务集群管理平台。当前为 **project-scaffold 样板骨架*
 ## 先读什么
 
 - `README.md`：工程快速上手（结构、启动、验证）
+- `docs/architecture.md`：**架构蓝图**——模块骨架与能力边界（server/worker/node 边界、依赖方向、契约、开发顺序；开发任何新模块前先读，守边界）
 - `docs/gpustack-borrowings.md`：**gpustack 借鉴调研**——vLLM 实例生命周期与显存分配的落地规格（写业务前必读）
 - `backend/tests/`：样板契约测试（了解响应/异常/模型/URL 契约的实际写法）
 - `.slim/clonedeps/repos/gpustack__gpustack/codemap.md`：gpustack 参考源码的 Repository Atlas（深入参考前先读导航）
@@ -130,7 +131,7 @@ bun run build                    # 构建（tsc + vite）
 ## 文档与样例
 
 - 接口/字段契约改动需同步本文件、`README.md` 与前端 `lib/api`。
-- `docs/` 现有 `gpustack-borrowings.md`（借鉴调研），后续业务设计文档（如 allocator、worker 契约）也放这里。
+- `docs/` 现有 `architecture.md`（架构蓝图/边界总纲）与 `gpustack-borrowings.md`（借鉴调研），后续业务设计文档（如 allocator、worker 契约）也放这里。
 
 ## Cloned Dependency Source
 
