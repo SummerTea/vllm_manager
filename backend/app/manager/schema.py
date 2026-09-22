@@ -76,7 +76,10 @@ class NodeRegisterRequest(BaseModel):
         min_length=1, max_length=255, description="主机名（幂等注册回退键）"
     )
     ip: str = Field(max_length=64, description="IP 地址")
-    advertise_address: str | None = Field(default=None, description="对外可达地址")
+    advertise_address: str | None = Field(
+        default=None,
+        description="对外可达地址（host:port 或纯 host；含端口时端口优先，纯 host 自动补 agent_port）",
+    )
     agent_port: int = Field(
         default=app_config.AGENT_DEFAULT_PORT,
         ge=1,
@@ -117,7 +120,10 @@ class NodeOut(BaseModel):
     machine_id: str | None = Field(default=None, description="机器唯一标识（幂等注册主键）")
     hostname: str = Field(description="主机名（幂等注册回退键）")
     ip: str = Field(description="IP 地址")
-    advertise_address: str | None = Field(default=None, description="对外可达地址")
+    advertise_address: str | None = Field(
+        default=None,
+        description="对外可达地址（host:port 或纯 host；含端口时端口优先，纯 host 自动补 agent_port）",
+    )
     agent_port: int = Field(description="agent 端口")
     state: str = Field(description="节点状态")
     state_message: str | None = Field(default=None, description="状态说明/失败原因")

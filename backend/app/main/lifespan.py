@@ -2,8 +2,9 @@
 应用生命周期管理
 负责初始化和清理全局资源
 """
+import asyncio
 import logging
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 
 from fastapi import FastAPI
 
@@ -42,9 +43,21 @@ async def lifespan(app: FastAPI):
     if "saq" not in app_config.DISABLED_EXTENSIONS:
         await init_saq()
 
+    # 5. 启动节点主动探测后台任务（依赖 DB，db 禁用时不启动）
+    prober_task: asyncio.Task | None = None
+    if "db" not in app_config.DISABLED_EXTENSIONS:
+        from app.manager.prober import probe_loop
+
+        prober_task = asyncio.create_task(probe_loop())
+
     yield
 
     # 清理资源
+    if prober_task is not None:
+        prober_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await prober_task
+
     if "redis" not in app_config.DISABLED_EXTENSIONS:
         await close_redis()
 
