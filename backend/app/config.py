@@ -91,6 +91,11 @@ class AppConfig(AppBaseConfig):
         description="worker 默认端口", default=8100
     )
 
+    # Allocator 域配置（Server 模块）
+    INSTANCE_DEFAULT_GMU: float = Field(
+        description="实例默认显存利用率 GMU（0-1），用户未指定时生效", default=0.9
+    )
+
 
 app_config = AppConfig()
 
