@@ -11,17 +11,17 @@ from app.base.base_response_schema import BaseResponse, EmptyResponse, PageRespo
 from app.config import app_config
 from app.exception import ForbiddenException, ResourceNotExistException
 from app.extensions.database import get_session
-from app.manager.dependencies import get_current_node
-from app.manager.enum import NodeStateEnum
-from app.manager.model import Node
-from app.manager.schema import (
+from app.manager.node.dependencies import get_current_node
+from app.manager.node.enum import NodeStateEnum
+from app.manager.node.model import Node
+from app.manager.node.schema import (
     NodeOut,
     NodeRegisterRequest,
     NodeRegisterResponse,
     NodeStatusReportRequest,
     NodeUpdateRequest,
 )
-from app.manager.service import NodeService
+from app.manager.node.service import NodeService
 
 # 安全姿态（过渡期）：
 # 管理端点（list/get/patch/delete）当前暂未接入会话鉴权，仅 agent 端点

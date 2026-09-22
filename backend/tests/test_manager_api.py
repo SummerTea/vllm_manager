@@ -12,10 +12,10 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.exc import IntegrityError
 
-import app.manager.model  # noqa: F401  (注册 Node 到 Base.metadata)
+import app.manager.node.model  # noqa: F401  (注册 Node 到 Base.metadata)
 from app.extensions.database import get_session
 from app.main import app
-from app.manager.service import NodeService
+from app.manager.node.service import NodeService
 
 _BASE = "/vllm_manager/api/v1/nodes"
 

@@ -5,9 +5,9 @@ from datetime import datetime
 
 from app.base.base_crud import BaseCrudService
 from app.config import app_config
-from app.manager.enum import NodeStateEnum
-from app.manager.model import Node
-from app.manager.schema import NodeRegisterRequest, NodeStatusReportRequest
+from app.manager.node.enum import NodeStateEnum
+from app.manager.node.model import Node
+from app.manager.node.schema import NodeRegisterRequest, NodeStatusReportRequest
 
 
 class NodeService(BaseCrudService[Node]):

@@ -46,7 +46,7 @@ async def lifespan(app: FastAPI):
     # 5. 启动节点主动探测后台任务（依赖 DB，db 禁用时不启动）
     prober_task: asyncio.Task | None = None
     if "db" not in app_config.DISABLED_EXTENSIONS:
-        from app.manager.prober import probe_loop
+        from app.manager.node.prober import probe_loop
 
         prober_task = asyncio.create_task(probe_loop())
 

@@ -14,7 +14,7 @@ from app.base.base_model import (
 )
 from app.config import app_config
 from app.extensions.database import db_config
-from app.manager.enum import NodeStateEnum
+from app.manager.node.enum import NodeStateEnum
 
 
 class Node(IdMixin, StatusMixin, BaseModel):

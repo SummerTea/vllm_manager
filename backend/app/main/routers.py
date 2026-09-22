@@ -1,7 +1,7 @@
 from fastapi import APIRouter
 
 from app.config import app_config
-from app.manager.api import node_router
+from app.manager.node.api import node_router
 
 
 def get_api_router() -> APIRouter:

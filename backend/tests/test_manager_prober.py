@@ -2,7 +2,7 @@
 Manager 模块 Node 主动探测（prober）契约测试。
 
 模式：conftest session 夹具 + httpx.MockTransport 模拟 /healthz 响应。
-顶部 import app.manager.model 确保 Node 注册进 Base.metadata 被 create_all 建表。
+顶部 import app.manager.node.model 确保 Node 注册进 Base.metadata 被 create_all 建表。
 """
 
 import asyncio
@@ -13,12 +13,12 @@ from typing import Any
 import httpx
 import pytest
 
-import app.manager.model  # noqa: F401  (注册 Node 到 Base.metadata)
+import app.manager.node.model  # noqa: F401  (注册 Node 到 Base.metadata)
 from app.config import app_config
-from app.manager.enum import NodeStateEnum
-from app.manager.prober import _probe_node, probe_loop
-from app.manager.schema import NodeRegisterRequest
-from app.manager.service import NodeService
+from app.manager.node.enum import NodeStateEnum
+from app.manager.node.prober import _probe_node, probe_loop
+from app.manager.node.schema import NodeRegisterRequest
+from app.manager.node.service import NodeService
 
 # 供 monkeypatch httpx.AsyncClient 的用例复用原始类（避免递归）
 _ORIGINAL_ASYNC_CLIENT = httpx.AsyncClient
@@ -136,7 +136,7 @@ async def test_probe_loop_smoke(monkeypatch):
     async def _sleep(_: float) -> None:
         raise asyncio.CancelledError()
 
-    monkeypatch.setattr("app.manager.prober.asyncio.sleep", _sleep)
+    monkeypatch.setattr("app.manager.node.prober.asyncio.sleep", _sleep)
     with pytest.raises(asyncio.CancelledError):
         await probe_loop()
 
@@ -205,9 +205,9 @@ async def test_probe_loop_success_path(session, monkeypatch):
         calls["sleep"] += 1
         raise asyncio.CancelledError()
 
-    monkeypatch.setattr("app.manager.prober.get_session_context", _ctx)
-    monkeypatch.setattr("app.manager.prober.httpx.AsyncClient", _client_factory)
-    monkeypatch.setattr("app.manager.prober.asyncio.sleep", _no_sleep)
+    monkeypatch.setattr("app.manager.node.prober.get_session_context", _ctx)
+    monkeypatch.setattr("app.manager.node.prober.httpx.AsyncClient", _client_factory)
+    monkeypatch.setattr("app.manager.node.prober.asyncio.sleep", _no_sleep)
 
     with pytest.raises(asyncio.CancelledError):
         await probe_loop()

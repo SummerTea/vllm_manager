@@ -8,8 +8,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.exception import UnauthorizedException
 from app.extensions.database import get_session
-from app.manager.model import Node
-from app.manager.service import NodeService
+from app.manager.node.model import Node
+from app.manager.node.service import NodeService
 
 
 async def get_current_node(

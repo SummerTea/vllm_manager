@@ -80,10 +80,11 @@ bun run build                    # 构建（tsc + vite）
 
 ### 命名与代码结构规范（参考 synapse-agent）
 
-**业务域包组织**：每个业务域一个包（如 `app/manager/`、`app/agent/`），内部按职责拆文件，不做大单体模块：
+**业务域包组织**：两级结构——业务域包（如 `app/manager/`、`app/agent/`）→ 子域包（如 `app/manager/node/`、`instance/`、`allocator/`）→ 职责文件。子域按业务聚合边界拆分（node=基础设施存在 / instance=工作负载生命周期 / allocator=分配决策），**子域间依赖单向：仅允许只读引用他域的 model/schema，禁止跨域 service 互调**（allocator 只读 node+instance，产出纯数据决策）。子域内部按职责拆文件，不做大单体模块：
 - `model.py`（ORM 模型）/ `schema.py`（Pydantic 请求/响应）/ `service.py`（业务逻辑，泛型 `BaseCrudService[T]` 基类）
 - `api.py`（公共 API，挂 `/vllm_manager/api/v1`）/ `web_api.py`（前端专用 API，挂 `/vllm_manager/web_api`）
 - `dependencies.py`（FastAPI 依赖注入）/ `enum.py`（业务枚举）/ `tasks.py`（SAQ 任务）
+- 横切文件（web_api/tasks 等）按子域归属，跨域路由聚合在 `app/main/routers.py` / `web_routers.py` 层，**不为二期预留空占位文件**（按需新建）
 
 **模型命名**：
 - 表类：单数驼峰，`class User(IdMixin, BaseModel, table=True)`；`__tablename__ = f"{db_config.TABLE_NAME_PREFIX}_user"`

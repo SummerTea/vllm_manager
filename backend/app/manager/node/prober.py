@@ -14,9 +14,9 @@ import httpx
 
 from app.config import app_config
 from app.extensions.database import get_session_context
-from app.manager.enum import NodeStateEnum
-from app.manager.model import Node
-from app.manager.service import NodeService
+from app.manager.node.enum import NodeStateEnum
+from app.manager.node.model import Node
+from app.manager.node.service import NodeService
 
 logger = logging.getLogger(__name__)
 

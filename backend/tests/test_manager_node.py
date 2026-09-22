@@ -2,16 +2,16 @@
 Manager 模块 Node 服务层契约测试。
 
 使用 sqlite 内存库（conftest session 夹具）验证注册/心跳/状态上报/状态派生逻辑。
-顶部 import app.manager.model 确保 Node 注册进 Base.metadata 被 create_all 建表。
+顶部 import app.manager.node.model 确保 Node 注册进 Base.metadata 被 create_all 建表。
 """
 
 from datetime import datetime, timedelta
 from typing import Any
 
-import app.manager.model  # noqa: F401  (注册 Node 到 Base.metadata)
+import app.manager.node.model  # noqa: F401  (注册 Node 到 Base.metadata)
 from app.config import app_config
-from app.manager.enum import NodeStateEnum
-from app.manager.schema import (
+from app.manager.node.enum import NodeStateEnum
+from app.manager.node.schema import (
     GPUDeviceStatus,
     MemoryInfo,
     NodeRegisterRequest,
@@ -19,7 +19,7 @@ from app.manager.schema import (
     NodeStatusReportRequest,
     SystemReserved,
 )
-from app.manager.service import NodeService
+from app.manager.node.service import NodeService
 
 
 def _req(**overrides: Any) -> NodeRegisterRequest:
