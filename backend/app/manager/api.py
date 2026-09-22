@@ -2,7 +2,7 @@
 
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -12,6 +12,7 @@ from app.config import app_config
 from app.exception import ForbiddenException, ResourceNotExistException
 from app.extensions.database import get_session
 from app.manager.dependencies import get_current_node
+from app.manager.enum import NodeStateEnum
 from app.manager.model import Node
 from app.manager.schema import (
     NodeOut,
@@ -22,6 +23,10 @@ from app.manager.schema import (
 )
 from app.manager.service import NodeService
 
+# 安全姿态（过渡期）：
+# 管理端点（list/get/patch/delete）当前暂未接入会话鉴权，仅 agent 端点
+# （heartbeat/status/register 走节点 token）。管理端点开放是过渡姿态，待 web
+# 鉴权里程碑接入会话鉴权后收敛。部署约束：仅限内网/本机可达，禁止直接暴露公网。
 node_router = APIRouter(prefix="/nodes", tags=["节点管理"])
 
 
@@ -38,10 +43,12 @@ async def register_node(
     try:
         node = await service.register(data)
     except IntegrityError:
+        # 当前唯一约束即 uix_node_machine_id，此冲突等价于并发重复注册；将来新增唯一约束需重新审视此分支
         await session.rollback()
         if data.machine_id:
             found = await service.get_by_field("machine_id", data.machine_id)
         else:
+            # 无 machine_id 时按 hostname 回退，并发双插无法被唯一索引拦截（幂等并发保证仅在携带 machine_id 时成立）
             found = await service.get_by_field("hostname", data.hostname)
         node = found if isinstance(found, Node) else None
         if node is None:
@@ -98,13 +105,13 @@ async def node_status_report(
 async def list_nodes(
     params: Annotated[PaginationParams, Depends()],
     session: Annotated[AsyncSession, Depends(get_session)],
-    state: str | None = None,
+    state: Annotated[NodeStateEnum | None, Query(description="按状态过滤")] = None,
     is_active: bool | None = None,
 ) -> PageResponse[NodeOut]:
-    """节点分页列表（支持 state/is_active 过滤）。"""
+    """节点分页列表（支持 state/is_active 过滤，非法 state 值由 FastAPI 直接 422）。"""
     filters: dict[str, Any] = {}
     if state is not None:
-        filters["state"] = state
+        filters["state"] = state.value
     if is_active is not None:
         filters["is_active"] = is_active
 
@@ -159,7 +166,10 @@ async def delete_node(
     node_id: str,
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> EmptyResponse:
-    """删除节点（物理删除）。"""
+    """删除节点（物理删除）。
+
+    # 二期 Instance 落地后，节点存在活跃实例时必须 409 拒绝删除
+    """
     deleted = await NodeService(session).delete(node_id)
     if not deleted:
         raise ResourceNotExistException(

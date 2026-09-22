@@ -6,22 +6,35 @@ sqlite 内存库 session（不触发 lifespan，不需要真实 PG/Redis）。
 每个测试独立 session/engine（conftest session 夹具为 function 级）。
 """
 
+from unittest.mock import patch
+
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy.exc import IntegrityError
 
 import app.manager.model  # noqa: F401  (注册 Node 到 Base.metadata)
 from app.extensions.database import get_session
 from app.main import app
+from app.manager.service import NodeService
 
 _BASE = "/vllm_manager/api/v1/nodes"
 
 
 @pytest.fixture
 def api_client(session):
-    """将 get_session 依赖替换为 conftest 的 sqlite session，测试后清理 override。"""
+    """将 get_session 依赖替换为 conftest 的 sqlite session，测试后清理 override。
+
+    模拟真实 get_session 的请求结束 commit 语义（否则 register 数据停留在未提交
+    事务中，api 兜底的 session.rollback() 会将其回滚导致重查不到）。
+    """
 
     async def _override_get_session():
-        yield session
+        try:
+            yield session
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise
 
     app.dependency_overrides[get_session] = _override_get_session
     try:
@@ -173,3 +186,48 @@ def test_delete_node(api_client):
     assert resp.status_code == 200
     got = api_client.get(f"{_BASE}/{data['node_id']}")
     assert got.status_code == 404
+
+
+def test_register_integrity_error_fallback(api_client):
+    """并发重复注册（IntegrityError）走兜底：返回已存在节点而非 500。"""
+    first = _register(api_client)
+
+    payload = {
+        "machine_id": "m-001",
+        "hostname": "gpu-01",
+        "ip": "10.0.0.1",
+        "advertise_address": "10.0.0.1:8100",
+        "agent_port": 8100,
+    }
+    with patch.object(
+        NodeService, "register", side_effect=IntegrityError("stmt", {}, Exception("dup"))
+    ):
+        resp = api_client.post(f"{_BASE}/register", json=payload)
+        assert resp.status_code == 200
+        data = resp.json()["data"]
+        assert data["node_id"] == first["node_id"]
+        assert data["token"] == first["token"]
+
+    # 恢复真实行为后幂等依旧成功
+    again = _register(api_client)
+    assert again["node_id"] == first["node_id"]
+    assert again["token"] == first["token"]
+
+
+def test_status_requires_token(api_client):
+    data = _register(api_client)
+    resp = api_client.post(f"{_BASE}/{data['node_id']}/status", json={})
+
+    assert resp.status_code == 401
+
+
+def test_status_wrong_node_403(api_client):
+    a = _register(api_client, machine_id="m-a", hostname="gpu-a")
+    b = _register(api_client, machine_id="m-b", hostname="gpu-b")
+    resp = api_client.post(
+        f"{_BASE}/{b['node_id']}/status",
+        headers=_auth(a["token"]),
+        json={},
+    )
+
+    assert resp.status_code == 403

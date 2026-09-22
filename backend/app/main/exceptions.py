@@ -15,8 +15,8 @@ from app.exception import (
     BusinessException,
     DuplicateResourceException,
     HttpException,
-    VllmManagerException,
     ResourceNotExistException,
+    VllmManagerException,
 )
 
 logger = logging.getLogger(__name__)

@@ -28,6 +28,7 @@ class Node(IdMixin, StatusMixin, BaseModel):
             unique=True,
             postgresql_where=text("machine_id IS NOT NULL"),
         ),
+        Index("uix_node_token", "token", unique=True),
         {"comment": "GPU 节点"},
     )
 

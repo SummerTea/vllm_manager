@@ -30,9 +30,9 @@ async def lifespan(app: FastAPI):
     # 1. 初始化日志
     init_logging()
 
-    # 2. 初始化数据库
+    # 2. 初始化数据库（开发环境自动建表，生产走迁移）
     if "db" not in app_config.DISABLED_EXTENSIONS:
-        await init_db()
+        await init_db(create_tables=(app_config.DEPLOY_ENV == "DEVELOPMENT"))
 
     # 3. 初始化 Redis
     if "redis" not in app_config.DISABLED_EXTENSIONS:
