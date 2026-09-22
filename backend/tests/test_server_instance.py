@@ -24,7 +24,11 @@ from app.server.instance.base import (
     is_target_achieved,
     reconcile_unreachable,
 )
-from app.server.instance.enum import InstanceStateEnum, InstanceTargetStateEnum
+from app.server.instance.enum import (
+    InstanceStateEnum,
+    InstanceTargetStateEnum,
+    InstanceTaskEnum,
+)
 from app.server.instance.model import VllmInstance
 from app.server.instance.schema import (
     InstanceReportItem,
@@ -111,7 +115,20 @@ async def _create_ready_instance(session, monkeypatch, **overrides) -> VllmInsta
 
 
 def test_estimate_vram_claim():
+    # LLM 口径：weight×1.2 + 2GiB（缺省 task 向后兼容）
     assert estimate_vram_claim(2 * _GIB) == int(2 * _GIB * 1.2) + 2 * _GIB
+    assert estimate_vram_claim(2 * _GIB, "auto") == int(2 * _GIB * 1.2) + 2 * _GIB
+    assert estimate_vram_claim(2 * _GIB, "llm") == int(2 * _GIB * 1.2) + 2 * _GIB
+
+
+def test_estimate_vram_claim_embedding_rerank_small_footprint():
+    """embedding/rerank 走 512MiB 口径（非 LLM 小模型开销小）。"""
+    expected = int(2 * _GIB * 1.2) + 512 * 1024 * 1024
+    assert estimate_vram_claim(2 * _GIB, "embedding") == expected
+    assert estimate_vram_claim(2 * _GIB, "rerank") == expected
+    assert estimate_vram_claim(
+        2 * _GIB, InstanceTaskEnum.EMBEDDING.value
+    ) == expected
 
 
 def test_apply_report_pure_clears_target_on_achieved():
@@ -222,6 +239,7 @@ async def test_create_success(session, monkeypatch):
     assert inst.gpu_memory_utilization == 0.9
     assert inst.model_weight_bytes == 2 * _GIB
     assert inst.tensor_parallel_size == 1
+    assert inst.task == InstanceTaskEnum.AUTO.value  # 缺省 task 落 auto
 
     # 权重广播 + 启动转发两次调用，校验启动转发 payload
     assert len(calls) == 2
@@ -234,10 +252,75 @@ async def test_create_success(session, monkeypatch):
     assert payload["vram_claim"] == inst.vram_claim
     assert payload["spec"] == {
         "model_name": "qwen2.5",
+        "task": "auto",
         "gpu_memory_utilization": 0.9,
         "tensor_parallel_size": 1,
         "args": [],
     }
+
+
+async def test_create_with_task_embedding(session, monkeypatch):
+    """task=embedding：记录.task、payload spec.task 落 embedding，vram_claim 走 512MiB 口径。"""
+    await _ready_node(session)
+    calls = []
+
+    async def fake_request_to_worker(node, method, path, **kwargs):
+        calls.append((method, path, kwargs))
+        return FakeResponse({"weight_bytes": 2 * _GIB})
+
+    monkeypatch.setattr(
+        "app.server.instance.service.creation.request_to_worker",
+        fake_request_to_worker,
+    )
+
+    inst = await VllmInstanceService(session).create(
+        VllmInstanceCreateRequest(
+            model_name="bge-m3", task=InstanceTaskEnum.EMBEDDING
+        )
+    )
+
+    assert inst.task == InstanceTaskEnum.EMBEDDING.value
+    assert inst.vram_claim == estimate_vram_claim(
+        2 * _GIB, InstanceTaskEnum.EMBEDDING.value
+    )
+    method, path, kwargs = calls[-1]
+    assert method == "post"
+    assert path == f"instances/{inst.id}/start"
+    payload = kwargs["json"]
+    assert payload["spec"]["task"] == "embedding"
+    assert payload["vram_claim"] == inst.vram_claim
+
+
+async def test_create_with_task_llm(session, monkeypatch):
+    """task=llm：记录.task、payload spec.task 落 llm，vram_claim 走 2GiB 口径（与 embedding 对称）。"""
+    await _ready_node(session)
+    calls = []
+
+    async def fake_request_to_worker(node, method, path, **kwargs):
+        calls.append((method, path, kwargs))
+        return FakeResponse({"weight_bytes": 2 * _GIB})
+
+    monkeypatch.setattr(
+        "app.server.instance.service.creation.request_to_worker",
+        fake_request_to_worker,
+    )
+
+    inst = await VllmInstanceService(session).create(
+        VllmInstanceCreateRequest(
+            model_name="qwen2.5", task=InstanceTaskEnum.LLM
+        )
+    )
+
+    assert inst.task == InstanceTaskEnum.LLM.value
+    assert inst.vram_claim == estimate_vram_claim(
+        2 * _GIB, InstanceTaskEnum.LLM.value
+    )
+    method, path, kwargs = calls[-1]
+    assert method == "post"
+    assert path == f"instances/{inst.id}/start"
+    payload = kwargs["json"]
+    assert payload["spec"]["task"] == "llm"
+    assert payload["vram_claim"] == inst.vram_claim
 
 
 async def test_create_vram_claim_override_skips_weight_broadcast(session, monkeypatch):

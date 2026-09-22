@@ -6,6 +6,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 from app.base.base_model import BaseModel, IdMixin, UniversalJSON
 from app.extensions.database import db_config
 from app.server.instance.base import InstanceLifecycleMixin
+from app.server.instance.enum import InstanceTaskEnum
 
 
 class VllmInstance(IdMixin, InstanceLifecycleMixin, BaseModel):
@@ -19,6 +20,12 @@ class VllmInstance(IdMixin, InstanceLifecycleMixin, BaseModel):
 
     model_name: Mapped[str] = mapped_column(
         String(255), comment="模型名称"
+    )
+    task: Mapped[str] = mapped_column(
+        String(32),
+        server_default="auto",  # DB 侧默认：旧表 ALTER ADD COLUMN 后存量行自动补 auto
+        default=InstanceTaskEnum.AUTO.value,
+        comment="vLLM 任务类型（auto/llm/embedding/rerank）",
     )
     model_weight_bytes: Mapped[int | None] = mapped_column(
         BigInteger, nullable=True, comment="模型权重大小（Bytes）"

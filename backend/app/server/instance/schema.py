@@ -4,13 +4,17 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.server.instance.enum import InstanceStateEnum
+from app.server.instance.enum import InstanceStateEnum, InstanceTaskEnum
 
 
 class VllmInstanceCreateRequest(BaseModel):
     """vLLM 实例创建请求。"""
 
     model_name: str = Field(min_length=1, description="模型名称")
+    task: InstanceTaskEnum = Field(
+        default=InstanceTaskEnum.AUTO,
+        description="vLLM 任务类型（auto 自动推断，按模型配置映射 --task）",
+    )
     vram_claim: int | None = Field(
         default=None, description="显存需求（Bytes），覆盖权重估算值"
     )
@@ -56,6 +60,7 @@ class VllmInstanceOut(BaseModel):
     restart_count: int = Field(description="重启次数")
     labels: dict = Field(default_factory=dict, description="标签")
     model_name: str = Field(description="模型名称")
+    task: str = Field(description="vLLM 任务类型（auto/llm/embedding/rerank）")
     model_weight_bytes: int | None = Field(
         default=None, description="模型权重大小（Bytes）"
     )

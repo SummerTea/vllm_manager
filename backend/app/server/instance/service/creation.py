@@ -41,6 +41,7 @@ def _build_start_payload(inst: VllmInstance) -> dict:
         "instance_type": "vllm",
         "spec": {
             "model_name": inst.model_name,
+            "task": inst.task,
             "gpu_memory_utilization": inst.gpu_memory_utilization,
             "tensor_parallel_size": inst.tensor_parallel_size,
             "args": inst.args,
@@ -107,10 +108,12 @@ async def create_vllm_instance(
             )
 
     # 4. 需求与 GMU 取值（vram_claim/gmu 用 is not None 判定，合法 0 交给 allocator 拒绝）
+    # `or 0` 为防御性兜底：estimate 仅在 vram_claim is None 时被调用，该路径下
+    # 权重必已确定非 None（请求覆盖或广播成功），显式 vram_claim 覆盖时不执行 estimate
     vram_claim = (
         data.vram_claim
         if data.vram_claim is not None
-        else estimate_vram_claim(model_weight_bytes or 0)
+        else estimate_vram_claim(model_weight_bytes or 0, data.task.value)
     )
     gmu = (
         data.gpu_memory_utilization
@@ -169,6 +172,7 @@ async def create_vllm_instance(
         gpu_memory_utilization=result.gpu_memory_utilization,
         tensor_parallel_size=data.tensor_parallel_size,
         model_name=data.model_name,
+        task=data.task.value,
         model_weight_bytes=model_weight_bytes,
         args=data.args or [],
         restart_count=0,

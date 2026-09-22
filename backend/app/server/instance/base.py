@@ -9,9 +9,14 @@ from sqlalchemy import BigInteger, Boolean, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.base.base_model import UniversalJSON, UniversalText
-from app.server.instance.enum import InstanceStateEnum, InstanceTargetStateEnum
+from app.server.instance.enum import (
+    InstanceStateEnum,
+    InstanceTargetStateEnum,
+    InstanceTaskEnum,
+)
 
 _GIB = 1024**3
+_MIB = 1024**2
 
 
 class InstanceLifecycleMixin:
@@ -54,8 +59,20 @@ class InstanceLifecycleMixin:
     )
 
 
-def estimate_vram_claim(weight_bytes: int) -> int:
-    """按模型权重估算显存需求（gpustack 实证公式：weight×1.2 + 2GiB）。"""
+def estimate_vram_claim(weight_bytes: int, task: str = "auto") -> int:
+    """按模型权重估算显存需求（gpustack 实证口径）。
+
+    口径边界：仅 `embedding`/`rerank` 两个 task 值走 512MiB 小模型口径；
+    其余任意值（含 vLLM 侧 `embed`、未知值）一律走 2GiB LLM 口径。
+    - embedding/rerank（非 LLM 小模型）：weight×1.2 + 512MiB（上下文/批次开销小）
+    - 其余（auto/llm 等）：weight×1.2 + 2GiB（LLM KV cache 与解码开销）
+    task 缺省走 LLM 口径，向后兼容既有调用。
+    """
+    if task in (
+        InstanceTaskEnum.EMBEDDING.value,
+        InstanceTaskEnum.RERANK.value,
+    ):
+        return int(weight_bytes * 1.2) + 512 * _MIB
     return int(weight_bytes * 1.2) + 2 * _GIB
 
 

@@ -66,8 +66,7 @@ allocator（分配决策：纯函数，零 DB IO）
 | worker→server | `POST /nodes/register`、`/nodes/{id}/heartbeat`、`/nodes/{id}/status` | ✅ 已定 |
 | worker→server | `POST /instances/report` | 实例状态对账（独立端点；gpustack 实证：实例状态独立于 worker-status 载荷） |
 | server→worker | `GET /healthz` | 节点健康探测（已落地，Bearer 豁免） |
-| server→worker | `POST /instances/{id}/start` | 启动指令（携带 `{instance_type, spec, gpu_indexes, vram_claim}`；vllm spec = `{model_name, gmu, tensor_parallel_size, args}`） |
-| server→worker | `POST /instances/{id}/stop` | 停止指令（仅携带 `{instance_type}`） |
+| server→worker | `POST /instances/{id}\|stop` | start 携带 `{instance_type, spec:{model_name, task, gmu, tensor_parallel_size, args}, gpu_indexes, vram_claim}`；stop 仅 `{instance_type}`。task 为产品层分类，worker 端按映射表组装 `--task`（vLLM 实际枚举）：`auto/llm → 不注入`（vLLM 自动推断，缺省 generate）、`embedding → --task embed`（勿用弃用别名 embedding）、`rerank → --task score`（cross-encoder；vLLM 版本演进如 0.21+ 移除 score 时按实际枚举映射）；args 已含 `--task` 时不重复注入 |
 | server→worker | `POST /models/weight` | 权重广播查询（并发取首个成功；响应 `{"weight_bytes": int}`） |
 
 **实例状态机**（借鉴 Tier1 #11，显式停止增强）：
