@@ -77,6 +77,7 @@ def estimate_vram_claim(weight_bytes: int, task: str = "auto") -> int:
 
 
 def apply_report(
+    current_state: str,
     target_state: str,
     state_message: str | None,
     port: int | None,
@@ -85,22 +86,41 @@ def apply_report(
     reported_state_message: str | None,
     reported_port: int | None,
     reported_restart_count: int | None,
-) -> tuple[str, str | None, int | None, int]:
-    """合并 worker 上报到实例字段，返回新字段元组（新 state 由调用处直接取上报值）。
+) -> tuple[str, str, str | None, int | None, int]:
+    """合并 worker 上报到实例字段，返回 (新 state, 新 target, 新 message, 新 port, 新 restart)。
 
     规则：
+    - new_state：取上报值，但受 M2 stopped 防复活守卫拦截（见下）。
     - target_state：仅当 is_target_achieved(reported_state, 当前 target) 成立时清回 none，
-      否则保留——防 stop/start 在途期间被中途上报（仍带旧 state）清掉 target，
-      否则实例会卡在旧状态且不再收敛（B1 竞态）。
+      否则保留——防 stop/start 在途期间被中途上报（仍带旧 state）清掉 target（B1 竞态）。
     - state_message：上报非 None 才更新，否则保留（防缺省上报抹掉已存错误信息）。
     - port/restart_count：仅上报非 None 时更新，否则保留原值。
+
+    M2 守卫（stopped 终态防复活）：无目标意图（target=none）时，已 stopped 实例不接受
+    任何非 stopped 上报——防 stop 收敛后，在途旧 running/error 上报晚到复活实例与占账。
+    有 target 意图（starting/stopping）期间不拦截（start 从 stopped 发起即依赖此路径）。
     """
     new_target = (
         InstanceTargetStateEnum.NONE.value
         if is_target_achieved(reported_state, target_state)
         else target_state
     )
+    if (
+        target_state == InstanceTargetStateEnum.NONE.value
+        and current_state == InstanceStateEnum.STOPPED.value
+        and reported_state != InstanceStateEnum.STOPPED.value
+    ):
+        # 守卫丢弃时返回 new_target（守卫触发时 target==none，new_target==none，
+        # 与正常路径对称，消隐 is_target_achieved 对 none 语义变化的隐性不一致）
+        return (
+            current_state,
+            new_target,
+            state_message,
+            port,
+            restart_count,
+        )
     return (
+        reported_state,
         new_target,
         reported_state_message
         if reported_state_message is not None

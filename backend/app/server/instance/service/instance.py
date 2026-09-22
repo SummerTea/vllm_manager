@@ -131,8 +131,9 @@ class VllmInstanceService(BaseCrudService[VllmInstance]):
     ) -> int:
         """对账：合并 worker 上报到本节点实例，并处理上报消失的实例。
 
-        - 上报存在：state 取上报值；target 仅达成时清回 none（防在途上报清掉
-          start/stop 目标，B1 竞态）；state_message/port/restart 非 None 才更新
+        - 上报存在：state 取上报值（stopped 终态防在途旧上报复活，M2）；target 仅
+          达成时清回 none（防在途上报清掉 start/stop 目标，B1 竞态）；
+          state_message/port/restart 非 None 才更新
         - 上报消失：target=stopping 的实例收敛为 stopped；其余不动（容忍 worker 重启窗口）
         - 返回处理条数；未知实例 id 忽略（记 debug 日志）
         """
@@ -146,13 +147,14 @@ class VllmInstanceService(BaseCrudService[VllmInstance]):
                 continue
             if inst.node_id != node_id:
                 continue
-            inst.state = item.state.value
             (
+                inst.state,
                 inst.target_state,
                 inst.state_message,
                 inst.port,
                 inst.restart_count,
             ) = apply_report_pure(
+                inst.state,
                 inst.target_state,
                 inst.state_message,
                 inst.port,

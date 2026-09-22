@@ -134,28 +134,28 @@ def test_estimate_vram_claim_embedding_rerank_small_footprint():
 def test_apply_report_pure_clears_target_on_achieved():
     # target=stopping + 上报 stopped → 达成清 target
     result = apply_report(
-        "stopping", "old", None, 0, "stopped", "ok", 8001, 1
+        "running", "stopping", "old", None, 0, "stopped", "ok", 8001, 1
     )
-    assert result == ("none", "ok", 8001, 1)
+    assert result == ("stopped", "none", "ok", 8001, 1)
 
 
 def test_apply_report_keeps_port_and_restart_when_not_reported():
     result = apply_report(
-        "none", "ok", 8001, 1, "running", "ok2", None, None
+        "running", "none", "ok", 8001, 1, "running", "ok2", None, None
     )
-    assert result == ("none", "ok2", 8001, 1)
+    assert result == ("running", "none", "ok2", 8001, 1)
 
 
 def test_apply_report_stopping_target_kept_until_stopped():
     """B1 竞态回归：stop 在途，上报 running/starting/error 均保留 target=stopping。"""
     for reported in ("running", "starting", "error"):
-        new_target, _, _, _ = apply_report(
-            "stopping", None, None, 0, reported, None, None, None
+        _, new_target, _, _, _ = apply_report(
+            "running", "stopping", None, None, 0, reported, None, None, None
         )
         assert new_target == "stopping", f"reported={reported}"
     # 上报 stopped → 达成清 target
-    new_target, _, _, _ = apply_report(
-        "stopping", None, None, 0, "stopped", None, None, None
+    _, new_target, _, _, _ = apply_report(
+        "running", "stopping", None, None, 0, "stopped", None, None, None
     )
     assert new_target == "none"
 
@@ -163,35 +163,120 @@ def test_apply_report_stopping_target_kept_until_stopped():
 def test_apply_report_starting_target_kept_until_running_or_error():
     """B1 竞态回归：start 在途，上报 starting/pending 保留 target=starting。"""
     for reported in ("starting", "pending"):
-        new_target, _, _, _ = apply_report(
-            "starting", None, None, 0, reported, None, None, None
+        _, new_target, _, _, _ = apply_report(
+            "stopped", "starting", None, None, 0, reported, None, None, None
         )
         assert new_target == "starting", f"reported={reported}"
     for reported in ("running", "error"):
-        new_target, _, _, _ = apply_report(
-            "starting", None, None, 0, reported, None, None, None
+        _, new_target, _, _, _ = apply_report(
+            "stopped", "starting", None, None, 0, reported, None, None, None
         )
         assert new_target == "none", f"reported={reported}"
 
 
 def test_apply_report_target_none_stays_none():
-    new_target, _, _, _ = apply_report(
-        "none", None, None, 0, "running", None, None, None
+    _, new_target, _, _, _ = apply_report(
+        "running", "none", None, None, 0, "running", None, None, None
     )
     assert new_target == "none"
 
 
 def test_apply_report_keeps_state_message_when_not_reported():
     """上报 state_message=None 不清掉已存错误信息（非 None 保护）。"""
-    _, new_message, _, _ = apply_report(
-        "stopping", "已有错误信息", None, 0, "running", None, None, None
+    _, _, new_message, _, _ = apply_report(
+        "running", "stopping", "已有错误信息", None, 0, "running", None, None, None
     )
     assert new_message == "已有错误信息"
     # 上报非 None 时正常更新
-    _, new_message, _, _ = apply_report(
-        "none", "已有信息", None, 0, "running", "新信息", None, None
+    _, _, new_message, _, _ = apply_report(
+        "running", "none", "已有信息", None, 0, "running", "新信息", None, None
     )
     assert new_message == "新信息"
+
+
+# ---------- M2 stopped 防复活守卫 ----------
+
+
+def test_apply_report_stopped_guard_blocks_stale_running():
+    """M2 核心：stopped 终态 + target none + 在途旧 running 上报晚到 → 整体丢弃不复活。"""
+    result = apply_report(
+        "stopped", "none", "手动停止", 8001, 2, "running", "ok", 9001, 3
+    )
+    assert result == ("stopped", "none", "手动停止", 8001, 2)
+
+
+def test_apply_report_stopped_guard_blocks_stale_error():
+    result = apply_report(
+        "stopped", "none", "手动停止", 8001, 2, "error", "启动失败", None, None
+    )
+    assert result == ("stopped", "none", "手动停止", 8001, 2)
+
+
+def test_apply_report_stopped_accepts_reported_stopped():
+    """stopped 终态下上报 stopped 属正常（幂等保持）。"""
+    result = apply_report(
+        "stopped", "none", None, 8001, 2, "stopped", "ok", 9001, 3
+    )
+    assert result == ("stopped", "none", "ok", 9001, 3)
+
+
+def test_apply_report_stopped_allowed_when_target_starting():
+    """start 意图期间不拦截：stopped + target=starting + 上报 running → 推进并清 target。"""
+    result = apply_report(
+        "stopped", "starting", None, None, 0, "running", "ok", 8001, 1
+    )
+    assert result == ("running", "none", "ok", 8001, 1)
+
+
+def test_apply_report_unreachable_recovers_to_running():
+    """恢复路径：unreachable 实例上报 running → 推进 running（非 stopped 不受守卫限制）。"""
+    result = apply_report(
+        "unreachable", "none", "节点失联", None, 0, "running", "ok", 8001, 1
+    )
+    assert result == ("running", "none", "ok", 8001, 1)
+
+
+def test_apply_report_error_recovers_to_running():
+    """恢复路径：error 实例上报 running → 推进 running（worker 重启恢复）。"""
+    result = apply_report(
+        "error", "none", "启动失败", None, 0, "running", "ok", None, None
+    )
+    assert result == ("running", "none", "ok", None, 0)
+
+
+def test_apply_report_stopped_allowed_when_target_stopping():
+    """B1 优先于 M2：current stopped + target stopping + 上报 running → 放行推进，
+    但 target 保留 stopping（守卫只在 target=none 触发，stop 意图收敛不被打断）。"""
+    result = apply_report(
+        "stopped", "stopping", "停止中", None, 0, "running", "ok", 8001, 1
+    )
+    assert result == ("running", "stopping", "ok", 8001, 1)
+
+
+def test_apply_report_stopped_blocks_reported_unreachable():
+    """M2 拦截面覆盖 unreachable：stopped 终态 + 上报 unreachable → 丢弃不复活。"""
+    result = apply_report(
+        "stopped", "none", "手动停止", 8001, 2, "unreachable", "节点失联", 9001, 3
+    )
+    assert result == ("stopped", "none", "手动停止", 8001, 2)
+
+
+def test_apply_report_error_accepts_reported_stopped():
+    """error 当前态上报 stopped → 放行（占账释放路径；防未来守卫条件扩写
+    误伤「非 stopped 当前态上报 stopped」）。"""
+    result = apply_report(
+        "error", "none", "启动失败", None, 0, "stopped", "已停止", 8001, 1
+    )
+    assert result == ("stopped", "none", "已停止", 8001, 1)
+
+
+def test_apply_report_stopped_keeps_starting_target_on_reported_stopped():
+    """B1 对称场景：start 在途（target starting）、worker 未起、上报仍 stopped
+    → target 保留 starting（未达成不清，否则 start 意图丢失）。"""
+    result = apply_report(
+        "stopped", "starting", None, None, 0, "stopped", "ok", 8001, 1
+    )
+    assert result == ("stopped", "starting", "ok", 8001, 1)
 
 
 def test_reconcile_unreachable():
@@ -579,6 +664,37 @@ async def test_apply_report_keeps_stopping_target_on_running_report(session, mon
         node.id, InstanceReportRequest(items=[])
     )
     assert inst.state == InstanceStateEnum.STOPPED.value
+
+
+async def test_apply_report_stopped_not_revived_by_late_running_report(session, monkeypatch):
+    """M2 竞态回归（service 层核心）：stop 收敛 stopped 后，在途旧 running 上报晚到
+    不得复活实例——state/target/message 全部保持。"""
+    node = await _ready_node(session)
+    inst = await _create_ready_instance(session, monkeypatch)
+    inst.state = InstanceStateEnum.STOPPED.value
+    inst.target_state = InstanceTargetStateEnum.NONE.value
+    inst.state_message = "手动停止"
+    await session.flush()
+
+    report = InstanceReportRequest(
+        items=[
+            InstanceReportItem(
+                id=inst.id,
+                state=InstanceStateEnum.RUNNING,
+                state_message="ok",
+                port=9001,
+                restart_count=3,
+            )
+        ]
+    )
+    count = await VllmInstanceService(session).apply_report(node.id, report)
+
+    assert count == 1
+    assert inst.state == InstanceStateEnum.STOPPED.value  # 未复活
+    assert inst.target_state == InstanceTargetStateEnum.NONE.value
+    assert inst.state_message == "手动停止"  # message 未覆盖
+    assert inst.port is None
+    assert inst.restart_count == 0
 
 
 async def test_apply_report_missing_with_target_stopping(session, monkeypatch):
