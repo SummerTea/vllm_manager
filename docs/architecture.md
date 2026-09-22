@@ -23,7 +23,7 @@
 |---|---|---|---|
 | server → `node` 子域 | 节点登记/心跳/状态/主动探测/失联判定 | `worker_manager` + `server/worker_syncer` + `worker_status_buffer` | ✅ 已落地 |
 | server → `instance` 子域 | 实例记录、状态机、启停指令转发、心跳对账、失联联动 | `serve_manager`(协调部分) + `server/controllers` | 📋 规划 |
-| server → `allocator` 子域 | 显存分配决策（纯函数：需求估算输入、first-fit 选卡、记账口径） | `vllm_resource_fit_selector` + `policies/utils` | 📋 规划 |
+| server → `allocator` 子域 | 显存分配决策（纯函数：需求估算输入、first-fit 选卡、记账口径） | `vllm_resource_fit_selector` + `policies/utils` | ✅ 已落地 |
 | server → 横切 `utils/request_to_worker` | server→worker 统一转发（Bearer 注入 + 超时） | `worker_request.py` | 📋 规划 |
 | worker（规划） | 注册/心跳/状态上报、实例生命周期、GPU 监控采集、权重统计 | `worker/*`（serve_manager + collector + backends/vllm） | 🚫 骨架无 |
 | frontend | 节点 GPU 分配视图、实例状态列表、创建/启停操作 | — | 骨架样板页 |
@@ -34,12 +34,14 @@
 ```
 node（基础设施存在：登记/心跳/状态/存活）
    ↑ 只读引用（node_id 归属、token、status GPU 表、system_reserved）
-instance（工作负载生命周期：记录/状态机/启停转发/对账/失联联动）
+instance（多类型工作负载生命周期：vllm / llmcache / 亲和路由…；记录/状态机/启停转发/对账/失联联动）
    ↑ 调用纯决策（输入由调用方取好，输出 {node_id, gpu_indexes, gmu} 或拒绝原因）
 allocator（分配决策：纯函数，零 DB IO）
 ```
 
 - **不设 `model` 子域**：模型信息（model_name/权重/vram_claim）作为 instance 的属性；权重缓存与模型列表二期按需再加
+- **instance 为多类型实例域**：每种组件一张表（现阶段 `vllm_manager_vllm_instance`，未来 llmcache/亲和路由各建各表）；公共字段用 `InstanceLifecycleMixin`、对账/状态机规则用纯函数（`instance/base.py`）跨类型复用。新增类型 = 新表 + 枚举扩展，编排/对账/allocator 零改动
+- **编排层 = InstanceService**（请求内同步编排：查候选节点→权重→allocator 决策→建记录→转发指令；无独立 scheduler/controller 线程——gpustack 的调度队列/事件总线已排除，状态收敛靠 agent report 对账 + `reconcile_loop` 后台任务）
 - **allocator 刻意无副作用**：可单测、可复用、不写库；记账由 instance 记录承载（停止/删除自然释放）
 - **worker 业务指令（启停/权重查询）只从 instance 域发出**；node 域仅健康探测（/healthz）与接收上报；`request_to_worker` 放 `app/utils/`（仅只读引用 node 域 token/base_url，不引入 service）解耦
 - 子域文件约定（依 AGENTS.md）：`model.py`/`schema.py`/`service.py`/`api.py`/`dependencies.py`/`enum.py`，**不为二期预留空占位文件**（按需新建）
@@ -64,7 +66,7 @@ allocator（分配决策：纯函数，零 DB IO）
 | worker→server | `POST /nodes/register`、`/nodes/{id}/heartbeat`、`/nodes/{id}/status` | ✅ 已定 |
 | worker→server | `POST /instances/report` | 实例状态对账（独立端点；gpustack 实证：实例状态独立于 worker-status 载荷） |
 | server→worker | `GET /healthz` | 节点健康探测（已落地，Bearer 豁免） |
-| server→worker | `POST /instances/{id}/start\|stop` | 启停指令（携带 `{gpu_indexes, gmu, args, model_name}`） |
+| server→worker | `POST /instances/{id}/start\|stop` | 启停指令（携带 `{instance_type, spec, gpu_indexes}`；vllm spec = `{model_name, gmu, tensor_parallel_size, args}`） |
 | server→worker | `POST /models/weight` | 权重广播查询（并发取首个成功） |
 
 **实例状态机**（借鉴 Tier1 #11，显式停止增强）：
@@ -86,9 +88,9 @@ K8s/网关、多租户、模型文件下载管理、多机分布式、调度队�
 ## 七、开发顺序
 
 1. ✅ 术语对齐（本蓝图前置，已提交）
-2. `allocator`（纯函数，最快落地可单测）
+2. ✅ `allocator`（纯函数，已提交）
 3. `utils/request_to_worker`（server→worker 统一转发，供 instance 使用）
-4. `instance`（依赖 allocator + request_to_worker：创建/启停/对账/失联）
+4. `instance`（多类型实例域，现阶段 vllm 表：依赖 allocator + request_to_worker；创建/启停/对账/失联）
 5. worker 契约文档（start/stop/weight/report 端点细化）
 6. worker 实现（生命周期/监控/鉴权）
 7. frontend（节点 GPU 分配视图、实例状态与操作）
