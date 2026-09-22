@@ -51,7 +51,7 @@ allocator（分配决策：纯函数，零 DB IO）
 | 能力 | 职责 | 对标 |
 |---|---|---|
 | 注册/心跳/状态 | 上报节点存活与 GPU/系统状态 | `worker_manager` / `collector` |
-| 实例生命周期 | start/stop、健康检查(`/v1/models` 1s)、状态机、指数退避重启、重启 restore | `serve_manager` |
+| 实例生命周期 | start/stop、健康检查(`/v1/models` 1s)、状态机、指数退避重启、重启 restore（仅恢复 running 实例，stopped 为终态不恢复） | `serve_manager` |
 | 显存启动前校验 | pynvml 空闲显存 ≥ 需求，不满足拒启（防超卖双保险） | `_start_model_instance` 前置 |
 | 权重统计 | 本地扫描 `.safetensors/.bin/.pt/.pth` 求和 | `get_local_model_weight_size` |
 | 端口分配 | 探测空闲端口 + 内存集合幂等 | `_assign_ports` |
@@ -72,7 +72,8 @@ allocator（分配决策：纯函数，零 DB IO）
 **实例状态机**（借鉴 Tier1 #11，显式停止增强）：
 - `state`：`pending → starting → running → stopped`；`→ error`（启动/运行失败，state_message 记原因）；`running → unreachable`（节点失联，恢复后对账拉回）
 - `target_state ∈ {none, starting, stopping}`：用户操作写入，达成后清回 none
-- 对账规则：上报有→更新+清 target；`target=stopping` 且上报消失→`stopped`+清 target；其余消失不动（容 worker 重启窗口）
+- **stopped 为终态**：worker 不 restore/不自动重启 stopped 实例，重新拉起唯一入口是 server start（`target=starting`）
+- 对账规则：上报有→更新+清 target（**无目标意图 target=none 时，已 stopped 实例不接受非 stopped 上报，防 stop 收敛后晚到的在途旧 running/error 上报复活实例与占账；target=starting/stopping 期间不拦截**）；`target=stopping` 且上报消失→`stopped`+清 target；其余消失不动（容 worker 重启窗口）
 
 **关键机制口径**（gpustack 源码实证，实现 allocator/instance 时照此）：
 - 记账：`available = total − Σ(未停止实例 allocated_vram) − reserved`；**starting/running/error/unreachable 均占账，stopped 释放**；reserved 整机级，每张卡都扣
@@ -80,6 +81,8 @@ allocator（分配决策：纯函数，零 DB IO）
 - 多卡 TP：候选卡（available/total > GMU）按可用显存字节降序累加，`Σ(total×GMU) ≥ vram_claim` 命中；**TP 整除校验落 worker 端**（server 无模型 config.json）
 - 需求：`vram_claim = weight×1.2 + 2GiB(LLM)`，支持请求内 `vram_claim`/`model_weight_bytes` 覆盖
 - 失联联动：节点心跳超时（offline）或主动探测失败（unreachable）时，仅 `running` 实例置 unreachable（不删除，人工介入；节点失联时直接删除实例可能残留 worker 侧孤儿进程——无记账但占显存，需人工介入）
+
+> 详细字段级规格见 docs/worker-contract.md
 
 ## 六、不做清单（明确排除）
 
