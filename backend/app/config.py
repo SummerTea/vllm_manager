@@ -90,6 +90,15 @@ class AppConfig(AppBaseConfig):
     WORKER_DEFAULT_PORT: int = Field(
         description="worker 默认端口", default=8100
     )
+    INSTANCE_REQUEST_TIMEOUT: int = Field(
+        description="server→worker 指令转发超时（秒）", default=15
+    )
+    INSTANCE_WEIGHT_TIMEOUT: int = Field(
+        description="权重广播查询超时（秒）", default=15
+    )
+    INSTANCE_RECONCILE_INTERVAL: int = Field(
+        description="实例失联对账周期（秒）", default=15
+    )
 
     # Allocator 域配置（Server 模块）
     INSTANCE_DEFAULT_GMU: float = Field(

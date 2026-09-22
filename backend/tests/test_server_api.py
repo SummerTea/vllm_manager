@@ -12,9 +12,11 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.exc import IntegrityError
 
+import app.server.instance.model  # noqa: F401  (注册 VllmInstance 到 Base.metadata)
 import app.server.node.model  # noqa: F401  (注册 Node 到 Base.metadata)
 from app.extensions.database import get_session
 from app.main import app
+from app.server.instance.model import VllmInstance
 from app.server.node.service import NodeService
 
 _BASE = "/vllm_manager/api/v1/nodes"
@@ -186,6 +188,30 @@ def test_delete_node(api_client):
     assert resp.status_code == 200
     got = api_client.get(f"{_BASE}/{data['node_id']}")
     assert got.status_code == 404
+
+
+def test_delete_node_with_active_instance_409(api_client, session):
+    """节点存在活跃（非 stopped）实例时删除 → 409（跨域守卫）。"""
+    data = _register(api_client)
+    # 直接落一条活跃实例（session.add 不触 IO，由删除请求内的 count 查询 autoflush 落库）
+    session.add(
+        VllmInstance(
+            node_id=data["node_id"],
+            state="running",
+            target_state="none",
+            model_name="qwen2.5",
+            gpu_indexes=[0],
+            args=[],
+            labels={},
+            allocated_vram={},
+            restart_count=0,
+        )
+    )
+
+    resp = api_client.delete(f"{_BASE}/{data['node_id']}")
+
+    assert resp.status_code == 409
+    assert "活跃实例" in resp.json()["message"]
 
 
 def test_register_integrity_error_fallback(api_client):

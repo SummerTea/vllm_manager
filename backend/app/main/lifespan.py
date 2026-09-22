@@ -50,6 +50,13 @@ async def lifespan(app: FastAPI):
 
         prober_task = asyncio.create_task(probe_loop())
 
+    # 6. 启动实例失联对账后台任务（依赖 DB，db 禁用时不启动）
+    reconcile_task: asyncio.Task | None = None
+    if "db" not in app_config.DISABLED_EXTENSIONS:
+        from app.server.instance.reconciler import reconcile_loop
+
+        reconcile_task = asyncio.create_task(reconcile_loop())
+
     yield
 
     # 清理资源
@@ -57,6 +64,11 @@ async def lifespan(app: FastAPI):
         prober_task.cancel()
         with suppress(asyncio.CancelledError):
             await prober_task
+
+    if reconcile_task is not None:
+        reconcile_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await reconcile_task
 
     if "redis" not in app_config.DISABLED_EXTENSIONS:
         await close_redis()

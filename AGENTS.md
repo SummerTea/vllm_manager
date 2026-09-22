@@ -97,6 +97,7 @@ bun run build                    # 构建（tsc + vite）
 - 所有字段 `Field(..., description="中文说明")`；响应 Schema 统一 `BaseResponse[XxxSchema]` 包裹
 
 **Service 命名**：`class XxxService(BaseCrudService[XxxModel])`；方法语义化动词（`get_by_username`/`authenticate`/`paginate`/`delete_with_relations`）；**Service/CRUD 默认不提交事务**（`commit=False`），由 API/路由层统一提交（样板 `get_session` 依赖自动 commit/rollback）。
+- **service 目录化**：service 逻辑复杂时拆为 `service/` 目录（`__init__.py` 聚合导出，import 面不变；编排等职责拆分到独立文件，如 instance 的 creation.py）
 
 **路由组织**：
 - `APIRouter(prefix="/xxx", tags=["中文标签"])`；端点函数 `async def` + `Depends(get_session)`/业务依赖

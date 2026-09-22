@@ -1,6 +1,7 @@
 from fastapi import APIRouter
 
 from app.config import app_config
+from app.server.instance.api import instance_router
 from app.server.node.api import node_router
 
 
@@ -10,5 +11,6 @@ def get_api_router() -> APIRouter:
 
     # 业务路由在此 include
     api_router.include_router(node_router)
+    api_router.include_router(instance_router)
 
     return api_router

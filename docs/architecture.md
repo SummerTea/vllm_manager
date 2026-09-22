@@ -66,8 +66,9 @@ allocator（分配决策：纯函数，零 DB IO）
 | worker→server | `POST /nodes/register`、`/nodes/{id}/heartbeat`、`/nodes/{id}/status` | ✅ 已定 |
 | worker→server | `POST /instances/report` | 实例状态对账（独立端点；gpustack 实证：实例状态独立于 worker-status 载荷） |
 | server→worker | `GET /healthz` | 节点健康探测（已落地，Bearer 豁免） |
-| server→worker | `POST /instances/{id}/start\|stop` | 启停指令（携带 `{instance_type, spec, gpu_indexes}`；vllm spec = `{model_name, gmu, tensor_parallel_size, args}`） |
-| server→worker | `POST /models/weight` | 权重广播查询（并发取首个成功） |
+| server→worker | `POST /instances/{id}/start` | 启动指令（携带 `{instance_type, spec, gpu_indexes, vram_claim}`；vllm spec = `{model_name, gmu, tensor_parallel_size, args}`） |
+| server→worker | `POST /instances/{id}/stop` | 停止指令（仅携带 `{instance_type}`） |
+| server→worker | `POST /models/weight` | 权重广播查询（并发取首个成功；响应 `{"weight_bytes": int}`） |
 
 **实例状态机**（借鉴 Tier1 #11，显式停止增强）：
 - `state`：`pending → starting → running → stopped`；`→ error`（启动/运行失败，state_message 记原因）；`running → unreachable`（节点失联，恢复后对账拉回）
@@ -79,7 +80,7 @@ allocator（分配决策：纯函数，零 DB IO）
 - 单卡判定：`available/total ≥ GMU` 且 `vram_claim ≤ total×GMU` → 记账 `total×GMU`
 - 多卡 TP：候选卡（available/total > GMU）按可用显存字节降序累加，`Σ(total×GMU) ≥ vram_claim` 命中；**TP 整除校验落 worker 端**（server 无模型 config.json）
 - 需求：`vram_claim = weight×1.2 + 2GiB(LLM)`，支持请求内 `vram_claim`/`model_weight_bytes` 覆盖
-- 失联联动：节点心跳超时（offline）或主动探测失败（unreachable）时，仅 `running` 实例置 unreachable（不删除，人工介入）
+- 失联联动：节点心跳超时（offline）或主动探测失败（unreachable）时，仅 `running` 实例置 unreachable（不删除，人工介入；节点失联时直接删除实例可能残留 worker 侧孤儿进程——无记账但占显存，需人工介入）
 
 ## 六、不做清单（明确排除）
 

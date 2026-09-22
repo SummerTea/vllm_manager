@@ -11,6 +11,9 @@ from app.base.base_response_schema import BaseResponse, EmptyResponse, PageRespo
 from app.config import app_config
 from app.exception import ForbiddenException, ResourceNotExistException
 from app.extensions.database import get_session
+
+# 唯一反向只读跨域例外：node 删除守卫消费 instance 域能力（assert_node_deletable）
+from app.server.instance.service import VllmInstanceService
 from app.server.node.dependencies import get_current_node
 from app.server.node.enum import NodeStateEnum
 from app.server.node.model import Node
@@ -168,8 +171,9 @@ async def delete_node(
 ) -> EmptyResponse:
     """删除节点（物理删除）。
 
-    # 二期 Instance 落地后，节点存在活跃实例时必须 409 拒绝删除
+    节点存在活跃实例时必须 409 拒绝删除（跨域守卫：VllmInstanceService.assert_node_deletable）。
     """
+    await VllmInstanceService(session).assert_node_deletable(node_id)
     deleted = await NodeService(session).delete(node_id)
     if not deleted:
         raise ResourceNotExistException(
