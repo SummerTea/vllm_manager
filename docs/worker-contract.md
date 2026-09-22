@@ -8,9 +8,10 @@
 
 ## 0. 定位与边界
 
-**worker 角色**：GPU 机器上的管控节点，监听 `:8100`（`WORKER_DEFAULT_PORT`）。**不连 PG**
-（`DISABLED_EXTENSIONS=db`），状态全部保存在进程内存中；server 的 PG 是唯一权威账本，
-worker 心跳/状态上报节点存活与 GPU 状态；实例状态经 `/instances/report` 独立端点对账。
+**worker 角色**：GPU 机器上的管控节点，监听 `:8100`（`WORKER_DEFAULT_PORT`）。**不连 PG、
+不初始化任何扩展**（无 DB/Redis 依赖，无需 `DISABLED_EXTENSIONS`），状态全部保存在
+进程内存中；server 的 PG 是唯一权威账本，worker 心跳/状态上报节点存活与 GPU 状态；
+实例状态经 `/instances/report` 独立端点对账。
 
 **依赖**：
 
@@ -21,8 +22,15 @@ worker 心跳/状态上报节点存活与 GPU 状态；实例状态经 `/instanc
 | GPU 监控采集 | pynvml 采集 GPU 设备状态（无 GPU/不可用时优雅降级：空列表 + 告警一次，绝不抛异常） | `collector` |
 | 权重统计 | 本地扫描模型目录 `.safetensors/.bin/.pt/.pth` 求和 | `policies/utils.py:get_local_model_weight_size` |
 
-**启动方式**：`DISABLED_EXTENSIONS=db`（不初始化 PG 扩展），uvicorn 监听端口
-`WORKER_DEFAULT_PORT`（8100）。worker 具体模块路径（`app/worker/` 域）由实现时定义。
+**启动方式**：worker 不初始化任何扩展（database/redis/saq 均不加载，**无需
+`DISABLED_EXTENSIONS` 环境变量**）；监听 `WORKER_DEFAULT_PORT`（8100）。启动命令：
+
+```bash
+uvicorn app.worker.main:create_app --factory --host 0.0.0.0
+```
+
+（`--host 0.0.0.0` 为硬约束：server 需经 `advertise_address`/`ip` 跨机回连 worker，
+绑定 127.0.0.1 会导致回连失败。）
 
 **对账闭环总览**：用户操作（创建/启停）→ server 写 `target_state` + 经
 `request_to_worker` 转发指令 → worker 在 GPU 机上执行（启动/停止/健康检查/退避重启）
@@ -303,8 +311,9 @@ worker ──/instances/report 上报实际 state/port/restart_count──▶ se
   （worker 若自作主张恢复/重启 stopped 实例并报 running，server 在无 target 意图时会
   静默忽略其非 stopped 上报，产生状态分叉）。
 - **健康检查**：进程存活 && `GET /v1/models` 200（单次 1s 超时）→ `running`；
-  **starting 超时总预算**：连续健康检查失败 N 次（默认 N=10，约 10s）或自启动起总时长
-  超 30s 判 `error`（默认值 worker 实现可调，需 ≥ 模型加载通常耗时）
+  **starting 超时总预算**：连续健康检查失败 N 次（默认 N=2，5s sync 周期 ×2 ≈10s 快速
+  失败）或自启动起总时长超 30s（兜底，模型加载超长时）判 `error`（默认值 worker 实现
+  可调，需 ≥ 模型加载通常耗时）
   （参考 `serve_manager.py:is_ready`）。
 - **指数退避重启**：**首次失败立即重试（delay=0）**，之后
   `delay = min(10·2^(n-1), 300s)`（n 为已退避次数，封顶 300s），`restart_count` 随上报
@@ -356,18 +365,24 @@ worker ──/instances/report 上报实际 state/port/restart_count──▶ se
 worker 实现时需要感知：`WORKER_DEFAULT_PORT`（默认监听端口）、
 `NODE_HEARTBEAT_INTERVAL`（心跳节奏，注册响应下发）、`INSTANCE_DEFAULT_GMU`
 （启动参数组装缺省 GMU）。其余为 server 侧约束/任务，worker 只需遵守端点契约。
+## 6. 定案回写（worker 实现已落地）+ 真待定项
 
-## 6. 待定/占位（worker 实现时细化）
+### 已定案（worker 实现落地，见 backend/app/worker/）
 
-- **模型路径解析策略**：`model_name` 作为本地绝对路径还是约定目录（如
-  `{model_root}/{model_name}`）？找不到目录/无权重文件时的返回（0 vs 错误）？——
-  由 worker 实现定义，server 侧按 `weight_bytes` 字段消费。
-- **GPU 监控上报字段细节**：pynvml 不可用/无 GPU 时的降级载荷（空 `gpu_devices` +
-  告警一次）、`filesystem`/`os`/`kernel`/`uptime` 的具体结构（dict 内容未冻结）。
-- **健康检查端口来源**：worker 分配端口后自持，report 回填 `port`；worker 重启
-  restore（pid 文件 + psutil）**仅恢复 running 实例，stopped 不恢复**（与 server M2
-  对账守卫长期一致，避免 worker 报 running、server 静默忽略的分叉）；恢复期间端口
-  复用策略待定。
-- **start 重复下发幂等选择**：200 幂等（推荐）vs 明确错误，worker 实现时定。
-- **worker 侧 stopping 过渡期上报值**：内存态有 stopping，但上报枚举无此值——worker
-  实现时明确过渡期上报 `starting`（停止中继续报原状态）或 `stopped`。
+| 项 | 定案 | 实现位置 |
+|---|---|---|
+| 模型路径解析 | `WORKER_MODEL_ROOT/{model_name}`（绝对路径/含分隔符直用）；找不到目录 → `/models/weight` 返 404（server 广播跳过该节点）、start 前校验失败 → ERROR record | `process_utils.py:resolve_model_path`、`lifecycle.py:start` |
+| start 重复下发幂等 | **200 幂等**（已存在 record 直接返回 accepted，不重建） | `lifecycle.py:start` |
+| stopping 过渡期上报 | worker 内存态有 STOPPING 但 `snapshot_for_report` 跳过；stop 完成清内存记录 → report 消失 → server 收敛 stopped | `lifecycle.py:snapshot_for_report` / `stop` |
+| GPU 优雅降级 | pynvml 不可用/无 GPU → 空 `gpu_devices` + 告警一次，绝不抛异常 | `collector.py:_collect_gpu_devices` |
+| restore 端口策略 | meta json（port/gpu_indexes/spec）+ psutil 存活判断，**仅恢复 running** 复用原端口；进程死删 meta | `lifecycle.py:restore` |
+| 退避重启 | 首次 delay=0，之后 `min(10·2^(n-1), 300)`；拒启类（retryable=False）不自动重启；重启前 pre-kill 存活旧进程 | `lifecycle.py:_maybe_restart` |
+
+### 真待定（worker 实现时细化）
+
+- **GPU 上报 dict 细节**：`filesystem`/`os`/`kernel`/`uptime` 已简化实现
+  （`collector.py`），结构可按需增补（当前：filesystem=[{name,mount_point,total,used}]、
+  os={name,version}、kernel={release,version}、uptime={seconds}）。
+- **starting 超时双阈值可调**：默认连续失败 N=2 ≈10s / 总时长 30s，当前为 worker
+  `lifecycle.py` 模块常量（`_STARTUP_FAIL_THRESHOLD`/`_STARTUP_TIMEOUT_SECONDS`），
+  如需运维可调可升配为 WorkerConfig 字段。

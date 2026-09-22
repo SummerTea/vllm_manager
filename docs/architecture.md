@@ -22,10 +22,10 @@
 | 模块 | 能力 | gpustack 参照 | 状态 |
 |---|---|---|---|
 | server → `node` 子域 | 节点登记/心跳/状态/主动探测/失联判定 | `worker_manager` + `server/worker_syncer` + `worker_status_buffer` | ✅ 已落地 |
-| server → `instance` 子域 | 实例记录、状态机、启停指令转发、心跳对账、失联联动 | `serve_manager`(协调部分) + `server/controllers` | 📋 规划 |
+| server → `instance` 子域 | 实例记录、状态机、启停指令转发、心跳对账、失联联动 | `serve_manager`(协调部分) + `server/controllers` | ✅ 已落地 |
 | server → `allocator` 子域 | 显存分配决策（纯函数：需求估算输入、first-fit 选卡、记账口径） | `vllm_resource_fit_selector` + `policies/utils` | ✅ 已落地 |
-| server → 横切 `utils/request_to_worker` | server→worker 统一转发（Bearer 注入 + 超时） | `worker_request.py` | 📋 规划 |
-| worker（规划） | 注册/心跳/状态上报、实例生命周期、GPU 监控采集、权重统计 | `worker/*`（serve_manager + collector + backends/vllm） | 🚫 骨架无 |
+| server → 横切 `utils/request_to_worker` | server→worker 统一转发（Bearer 注入 + 超时） | `worker_request.py` | ✅ 已落地 |
+| worker | 注册/心跳/状态上报、实例生命周期（start/stop/健康检查/退避重启/restore）、GPU 采集（pynvml 优雅降级）、权重统计、参数组装（task 映射+env 注入）、Bearer 鉴权 | `worker/*`（serve_manager + collector + backends/vllm） | ✅ 已实现 |
 | frontend | 节点 GPU 分配视图、实例状态列表、创建/启停操作 | — | 骨架样板页 |
 | 明确不做 | 见「六、不做清单」 | 借鉴文档排除清单 | — |
 
@@ -57,7 +57,7 @@ allocator（分配决策：纯函数，零 DB IO）
 | 端口分配 | 探测空闲端口 + 内存集合幂等 | `_assign_ports` |
 | 参数组装 | 用户参数优先，缺省补 `--port/--served-model-name/GMU/--tensor-parallel-size` + env 注入（OMP/SAFETENSORS/VLLM_CACHE_ROOT） | `vllm.py` |
 | 鉴权 | 除注册外全部端点 Bearer token | `api/auth.py` |
-| 不连 PG | `DISABLED_EXTENSIONS=db`，状态全内存 | — |
+| 不连 PG | 不初始化任何扩展（无 DB/Redis 依赖，无需 `DISABLED_EXTENSIONS`），状态全内存 | — |
 
 ## 五、server↔worker 契约边界
 
@@ -92,10 +92,10 @@ K8s/网关、多租户、模型文件下载管理、多机分布式、调度队�
 
 1. ✅ 术语对齐（本蓝图前置，已提交）
 2. ✅ `allocator`（纯函数，已提交）
-3. `utils/request_to_worker`（server→worker 统一转发，供 instance 使用）
-4. `instance`（多类型实例域，现阶段 vllm 表：依赖 allocator + request_to_worker；创建/启停/对账/失联）
-5. worker 契约文档（start/stop/weight/report 端点细化）
-6. worker 实现（生命周期/监控/鉴权）
+3. ✅ `utils/request_to_worker`（server→worker 统一转发，供 instance 使用）
+4. ✅ `instance`（多类型实例域，现阶段 vllm 表：依赖 allocator + request_to_worker；创建/启停/对账/失联）
+5. ✅ worker 契约文档（start/stop/weight/report 端点细化）
+6. ✅ worker 实现（生命周期/监控/鉴权）
 7. frontend（节点 GPU 分配视图、实例状态与操作）
 
 ## 八、术语与命名速查

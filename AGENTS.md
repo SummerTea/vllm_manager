@@ -1,6 +1,6 @@
 # vllm_manager
 
-vLLM 推理服务集群管理平台。当前为 **project-scaffold 样板骨架**（backend + frontend 双目录模块化单体），业务功能（GPU 节点登记、基于显卡显存的 vLLM 实例分配/启停、GPU 监控）将逐个在此骨架上实现。
+vLLM 推理服务集群管理平台。**server 端（节点/实例/allocator）+ worker 端（通信闭环/生命周期）已实现**（backend + frontend 双目录模块化单体），GPU 节点登记、基于显存分配、vLLM 实例启停与 GPU 监控链路已打通。
 
 **规划**：server 管理端（Web + REST，:8000）通过 REST 向各 GPU 机器上的 worker 管控节点（:8100）转发启停指令，并基于显存对 vLLM 实例做分配管理。
 
@@ -17,7 +17,7 @@ vLLM 推理服务集群管理平台。当前为 **project-scaffold 样板骨架*
 | 入口 | 位置 | 端口 | 说明 |
 |------|------|------|------|
 | backend server | `backend/app/main:app` | 8000 | Web + REST 管理端（lifespan：init_logging→db→redis→saq） |
-| backend worker | 规划中（骨架无） | 8100 | 管控节点（GPU 机器，**不连 PG**，用 `DISABLED_EXTENSIONS=db`） |
+| backend worker | `backend/app/work_worker.py`（`python app/work_worker.py`） | 8100 | 管控节点（GPU 机器，**不连 PG，不初始化任何扩展**——无 DB/Redis 依赖，无需 `DISABLED_EXTENSIONS`；默认 `--host 0.0.0.0`，端口由 `WORKER_LISTEN_PORT` 配置，server 跨机回连硬约束） |
 | backend SAQ worker | `backend/app/work_saq.py` | — | `python app/work_saq.py -q default` |
 | frontend SPA | `frontend/` | 5178(dev) | 管理页面，访问路径 `/vllm_manager/frontend/` |
 
@@ -38,10 +38,22 @@ vllm_manager/
 │   │   ├── exception.py               # 分层异常体系（业务异常在此定义）
 │   │   ├── main/                      # 入口包：app 单例/lifespan/routers(api/v1 聚合)/web_routers/static_files(SafeStaticFiles)
 │   │   ├── work_saq.py                # SAQ worker 入口（argparse -q/-c/--check）
+│   │   ├── work_worker.py             # worker 入口（uvicorn create_app --host/--check，端口 WORKER_LISTEN_PORT）
+│   │   ├── worker/                    # Worker 域（:8100 管控节点，不连 PG，状态全内存）
+│   │   │   ├── config.py              # WorkerConfig（SERVER_URL/监听端口/模型根目录/周期/预留）
+│   │   │   ├── enum.py                # WorkerInstanceStateEnum（pending/starting/running/stopping/error）
+│   │   │   ├── schema.py              # StartRequest/StopRequest/WeightRequest/VllmSpec
+│   │   │   ├── server_client.py       # ServerClient（注册重试/心跳/状态/实例对账上报）
+│   │   │   ├── collector.py           # GPU/系统采集（pynvml 优雅降级）
+│   │   │   ├── main.py                # create_app + lifespan（注册→restore→后台循环）
+│   │   │   ├── exceptions.py          # JSON-only 异常处理器（独立于 server）
+│   │   │   ├── process_utils.py       # 端口/进程树/路径/命令组装/env
+│   │   │   ├── lifecycle.py           # 实例生命周期（start/stop/健康检查/退避重启/restore）
+│   │   │   └── api.py                 # start/stop/weight 端点（Bearer 鉴权）
 │   │   ├── base/                      # base_config/base_crud(泛型)/base_enum/base_model(UUID7 Id + Timestamp)/响应契约(BaseResponse/ListResponse)
 │   │   ├── extensions/                # database/redis/saq/logging 单例（全部懒加载，import 零连接）
 │   │   └── utils/
-│   └── tests/                         # 样板契约测试（pytest，16 passed）
+│   └── tests/                         # 契约测试（pytest，190 passed）
 ├── frontend/
 │   ├── package.json / vite.config.ts  # bun；base=/vllm_manager/frontend/
 │   └── src/
@@ -61,6 +73,8 @@ vllm_manager/
 poetry install
 poetry run uvicorn app.main:app --port 8000        # server 入口（需 PG + Redis）
 poetry run python app/work_saq.py -q default       # SAQ worker
+poetry run python app/work_worker.py                    # worker 管控节点（--host 0.0.0.0，端口 WORKER_LISTEN_PORT）
+poetry run python app/work_worker.py --check            # worker 健康检查
 poetry run pytest                                  # 样板契约测试
 poetry run ruff check app                          # lint
 
