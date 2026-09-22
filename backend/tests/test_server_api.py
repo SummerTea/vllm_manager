@@ -1,5 +1,5 @@
 """
-Manager 模块 Node API 契约测试。
+Server 模块 Node API 契约测试。
 
 模式：TestClient(app) + dependency_overrides[get_session] 复用 conftest 的
 sqlite 内存库 session（不触发 lifespan，不需要真实 PG/Redis）。
@@ -12,10 +12,10 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.exc import IntegrityError
 
-import app.manager.node.model  # noqa: F401  (注册 Node 到 Base.metadata)
+import app.server.node.model  # noqa: F401  (注册 Node 到 Base.metadata)
 from app.extensions.database import get_session
 from app.main import app
-from app.manager.node.service import NodeService
+from app.server.node.service import NodeService
 
 _BASE = "/vllm_manager/api/v1/nodes"
 
@@ -49,7 +49,7 @@ def _register(client: TestClient, **overrides) -> dict:
         "hostname": "gpu-01",
         "ip": "10.0.0.1",
         "advertise_address": "10.0.0.1:8100",
-        "agent_port": 8100,
+        "worker_port": 8100,
     }
     payload.update(overrides)
     resp = client.post(f"{_BASE}/register", json=payload)
@@ -66,7 +66,7 @@ def test_register_public_returns_token(api_client):
 
     assert data["node_id"]
     assert data["token"]
-    assert data["agent_port"] == 8100
+    assert data["worker_port"] == 8100
     assert data["heartbeat_interval"] == 10
 
 
@@ -197,7 +197,7 @@ def test_register_integrity_error_fallback(api_client):
         "hostname": "gpu-01",
         "ip": "10.0.0.1",
         "advertise_address": "10.0.0.1:8100",
-        "agent_port": 8100,
+        "worker_port": 8100,
     }
     with patch.object(
         NodeService, "register", side_effect=IntegrityError("stmt", {}, Exception("dup"))

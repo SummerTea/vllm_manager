@@ -74,9 +74,9 @@ class AppConfig(AppBaseConfig):
         default=[],
     )
 
-    # Node 域配置（Manager 模块）
+    # Node 域配置（Server 模块）
     NODE_HEARTBEAT_INTERVAL: int = Field(
-        description="建议心跳间隔（秒），注册时下发给 agent", default=10
+        description="建议心跳间隔（秒），注册时下发给 worker", default=10
     )
     NODE_HEARTBEAT_GRACE_PERIOD: int = Field(
         description="心跳超时阈值（秒），超过则节点置 offline", default=30
@@ -87,8 +87,8 @@ class AppConfig(AppBaseConfig):
     NODE_PROBE_TIMEOUT: int = Field(
         description="主动探测 /healthz 超时（秒）", default=3
     )
-    AGENT_DEFAULT_PORT: int = Field(
-        description="agent 默认端口", default=8100
+    WORKER_DEFAULT_PORT: int = Field(
+        description="worker 默认端口", default=8100
     )
 
 

@@ -1,4 +1,4 @@
-"""Manager 模块 Node 请求/响应 Schema。"""
+"""Server 模块 Node 请求/响应 Schema。"""
 
 from datetime import datetime
 from typing import Any
@@ -78,13 +78,13 @@ class NodeRegisterRequest(BaseModel):
     ip: str = Field(max_length=64, description="IP 地址")
     advertise_address: str | None = Field(
         default=None,
-        description="对外可达地址（host:port 或纯 host；含端口时端口优先，纯 host 自动补 agent_port）",
+        description="对外可达地址（host:port 或纯 host；含端口时端口优先，纯 host 自动补 worker_port）",
     )
-    agent_port: int = Field(
-        default=app_config.AGENT_DEFAULT_PORT,
+    worker_port: int = Field(
+        default=app_config.WORKER_DEFAULT_PORT,
         ge=1,
         le=65535,
-        description="agent 端口",
+        description="worker 端口",
     )
 
 
@@ -93,7 +93,7 @@ class NodeRegisterResponse(BaseModel):
 
     node_id: str = Field(description="节点 ID")
     token: str = Field(description="Bearer 鉴权令牌")
-    agent_port: int = Field(description="agent 端口")
+    worker_port: int = Field(description="worker 端口")
     heartbeat_interval: int = Field(description="建议心跳间隔（秒）")
 
 
@@ -122,9 +122,9 @@ class NodeOut(BaseModel):
     ip: str = Field(description="IP 地址")
     advertise_address: str | None = Field(
         default=None,
-        description="对外可达地址（host:port 或纯 host；含端口时端口优先，纯 host 自动补 agent_port）",
+        description="对外可达地址（host:port 或纯 host；含端口时端口优先，纯 host 自动补 worker_port）",
     )
-    agent_port: int = Field(description="agent 端口")
+    worker_port: int = Field(description="worker 端口")
     state: str = Field(description="节点状态")
     state_message: str | None = Field(default=None, description="状态说明/失败原因")
     unreachable: bool = Field(description="主动探测不可达标志")

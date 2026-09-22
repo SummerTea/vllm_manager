@@ -2,7 +2,7 @@
 
 vLLM 推理服务集群管理平台。当前为 **project-scaffold 样板骨架**（backend + frontend 双目录模块化单体），业务功能（GPU 节点登记、基于显卡显存的 vLLM 实例分配/启停、GPU 监控）将逐个在此骨架上实现。
 
-**规划**：manager 管理端（Web + REST，:8000）通过 REST 向各 GPU 机器上的 agent 管控节点（:8100）转发启停指令，并基于显存对 vLLM 实例做分配管理。
+**规划**：server 管理端（Web + REST，:8000）通过 REST 向各 GPU 机器上的 worker 管控节点（:8100）转发启停指令，并基于显存对 vLLM 实例做分配管理。
 
 ## 先读什么
 
@@ -15,8 +15,8 @@ vLLM 推理服务集群管理平台。当前为 **project-scaffold 样板骨架*
 
 | 入口 | 位置 | 端口 | 说明 |
 |------|------|------|------|
-| backend manager | `backend/app/main:app` | 8000 | Web + REST 管理端（lifespan：init_logging→db→redis→saq） |
-| backend agent | 规划中（骨架无） | 8100 | 管控节点（GPU 机器，**不连 PG**，用 `DISABLED_EXTENSIONS=db`） |
+| backend server | `backend/app/main:app` | 8000 | Web + REST 管理端（lifespan：init_logging→db→redis→saq） |
+| backend worker | 规划中（骨架无） | 8100 | 管控节点（GPU 机器，**不连 PG**，用 `DISABLED_EXTENSIONS=db`） |
 | backend SAQ worker | `backend/app/work_saq.py` | — | `python app/work_saq.py -q default` |
 | frontend SPA | `frontend/` | 5178(dev) | 管理页面，访问路径 `/vllm_manager/frontend/` |
 
@@ -58,7 +58,7 @@ vllm_manager/
 ```bash
 # backend（工作目录 backend/）
 poetry install
-poetry run uvicorn app.main:app --port 8000        # manager 入口（需 PG + Redis）
+poetry run uvicorn app.main:app --port 8000        # server 入口（需 PG + Redis）
 poetry run python app/work_saq.py -q default       # SAQ worker
 poetry run pytest                                  # 样板契约测试
 poetry run ruff check app                          # lint
@@ -80,7 +80,7 @@ bun run build                    # 构建（tsc + vite）
 
 ### 命名与代码结构规范（参考 synapse-agent）
 
-**业务域包组织**：两级结构——业务域包（如 `app/manager/`、`app/agent/`）→ 子域包（如 `app/manager/node/`、`instance/`、`allocator/`）→ 职责文件。子域按业务聚合边界拆分（node=基础设施存在 / instance=工作负载生命周期 / allocator=分配决策），**子域间依赖单向：仅允许只读引用他域的 model/schema，禁止跨域 service 互调**（allocator 只读 node+instance，产出纯数据决策）。子域内部按职责拆文件，不做大单体模块：
+**业务域包组织**：两级结构——业务域包（如 `app/server/`、`app/worker/`）→ 子域包（如 `app/server/node/`、`instance/`、`allocator/`）→ 职责文件。子域按业务聚合边界拆分（node=基础设施存在 / instance=工作负载生命周期 / allocator=分配决策），**子域间依赖单向：仅允许只读引用他域的 model/schema，禁止跨域 service 互调**（allocator 只读 node+instance，产出纯数据决策）。子域内部按职责拆文件，不做大单体模块：
 - `model.py`（ORM 模型）/ `schema.py`（Pydantic 请求/响应）/ `service.py`（业务逻辑，泛型 `BaseCrudService[T]` 基类）
 - `api.py`（公共 API，挂 `/vllm_manager/api/v1`）/ `web_api.py`（前端专用 API，挂 `/vllm_manager/web_api`）
 - `dependencies.py`（FastAPI 依赖注入）/ `enum.py`（业务枚举）/ `tasks.py`（SAQ 任务）
@@ -130,12 +130,12 @@ bun run build                    # 构建（tsc + vite）
 ## 文档与样例
 
 - 接口/字段契约改动需同步本文件、`README.md` 与前端 `lib/api`。
-- `docs/` 现有 `gpustack-borrowings.md`（借鉴调研），后续业务设计文档（如 allocator、agent 契约）也放这里。
+- `docs/` 现有 `gpustack-borrowings.md`（借鉴调研），后续业务设计文档（如 allocator、worker 契约）也放这里。
 
 ## Cloned Dependency Source
 
 Read-only dependency source repositories are available under
 `.slim/clonedeps/repos/` for inspection. Do not edit these clones.
 
-- `.slim/clonedeps/repos/gpustack__gpustack/` — gpustack/gpustack at v2.2.3; GPU 集群管理参考实现，worker 端 vLLM 实例启停（serve_manager.py、backends/vllm.py）、GPU 监控与指标采集对标本项目的 agent 端。
+- `.slim/clonedeps/repos/gpustack__gpustack/` — gpustack/gpustack at v2.2.3; GPU 集群管理参考实现，worker 端 vLLM 实例启停（serve_manager.py、backends/vllm.py）、GPU 监控与指标采集对标本项目的 worker 端。
   - 仓库导航：先读该仓库根 `codemap.md`（Repository Atlas，含目录职责总表与阅读顺序），深入某目录前读对应 `codemap.md`（如 `gpustack/worker/codemap.md`）。

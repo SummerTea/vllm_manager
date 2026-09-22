@@ -35,7 +35,7 @@ vllm_manager/
 # backend（工作目录 backend/）
 poetry install
 cp .env.example .env          # 按需修改（本机默认配置已写好 backend/.env）
-poetry run uvicorn app.main:app --port 8000     # manager 入口
+poetry run uvicorn app.main:app --port 8000     # server 入口
 poetry run pytest                              # 样板契约测试（16 passed）
 
 # frontend（工作目录 frontend/）

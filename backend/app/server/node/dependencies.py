@@ -1,4 +1,4 @@
-"""Manager 模块 Node 鉴权依赖。"""
+"""Server 模块 Node 鉴权依赖。"""
 
 import secrets
 from typing import Annotated
@@ -8,8 +8,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.exception import UnauthorizedException
 from app.extensions.database import get_session
-from app.manager.node.model import Node
-from app.manager.node.service import NodeService
+from app.server.node.model import Node
+from app.server.node.service import NodeService
 
 
 async def get_current_node(

@@ -1,8 +1,8 @@
 """
-Manager 模块 Node 主动探测（prober）契约测试。
+Server 模块 Node 主动探测（prober）契约测试。
 
 模式：conftest session 夹具 + httpx.MockTransport 模拟 /healthz 响应。
-顶部 import app.manager.node.model 确保 Node 注册进 Base.metadata 被 create_all 建表。
+顶部 import app.server.node.model 确保 Node 注册进 Base.metadata 被 create_all 建表。
 """
 
 import asyncio
@@ -13,12 +13,12 @@ from typing import Any
 import httpx
 import pytest
 
-import app.manager.node.model  # noqa: F401  (注册 Node 到 Base.metadata)
+import app.server.node.model  # noqa: F401  (注册 Node 到 Base.metadata)
 from app.config import app_config
-from app.manager.node.enum import NodeStateEnum
-from app.manager.node.prober import _probe_node, probe_loop
-from app.manager.node.schema import NodeRegisterRequest
-from app.manager.node.service import NodeService
+from app.server.node.enum import NodeStateEnum
+from app.server.node.prober import _probe_node, probe_loop
+from app.server.node.schema import NodeRegisterRequest
+from app.server.node.service import NodeService
 
 # 供 monkeypatch httpx.AsyncClient 的用例复用原始类（避免递归）
 _ORIGINAL_ASYNC_CLIENT = httpx.AsyncClient
@@ -30,7 +30,7 @@ def _req(**overrides: Any) -> NodeRegisterRequest:
         "hostname": "gpu-01",
         "ip": "10.0.0.1",
         "advertise_address": None,
-        "agent_port": 8100,
+        "worker_port": 8100,
     }
     base.update(overrides)
     return NodeRegisterRequest(**base)
@@ -136,13 +136,13 @@ async def test_probe_loop_smoke(monkeypatch):
     async def _sleep(_: float) -> None:
         raise asyncio.CancelledError()
 
-    monkeypatch.setattr("app.manager.node.prober.asyncio.sleep", _sleep)
+    monkeypatch.setattr("app.server.node.prober.asyncio.sleep", _sleep)
     with pytest.raises(asyncio.CancelledError):
         await probe_loop()
 
 
 async def test_probe_uses_advertise_address_url(session):
-    """advertise_address 为 host:port 一体时直接使用，不再拼 agent_port。"""
+    """advertise_address 为 host:port 一体时直接使用，不再拼 worker_port。"""
     svc = NodeService(session)
     node = await svc.register(_req(advertise_address="10.0.0.1:9999"))
     node.heartbeat_time = datetime.now()  # 心跳新鲜
@@ -205,9 +205,9 @@ async def test_probe_loop_success_path(session, monkeypatch):
         calls["sleep"] += 1
         raise asyncio.CancelledError()
 
-    monkeypatch.setattr("app.manager.node.prober.get_session_context", _ctx)
-    monkeypatch.setattr("app.manager.node.prober.httpx.AsyncClient", _client_factory)
-    monkeypatch.setattr("app.manager.node.prober.asyncio.sleep", _no_sleep)
+    monkeypatch.setattr("app.server.node.prober.get_session_context", _ctx)
+    monkeypatch.setattr("app.server.node.prober.httpx.AsyncClient", _client_factory)
+    monkeypatch.setattr("app.server.node.prober.asyncio.sleep", _no_sleep)
 
     with pytest.raises(asyncio.CancelledError):
         await probe_loop()

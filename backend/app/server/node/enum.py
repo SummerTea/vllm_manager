@@ -1,4 +1,4 @@
-"""Manager 模块业务枚举。"""
+"""Server 模块业务枚举。"""
 
 from app.base.base_enum import LabeledStrEnum
 

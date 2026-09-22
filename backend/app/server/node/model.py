@@ -1,4 +1,4 @@
-"""Manager 模块 Node 数据模型。"""
+"""Server 模块 Node 数据模型。"""
 
 from datetime import datetime
 
@@ -14,7 +14,7 @@ from app.base.base_model import (
 )
 from app.config import app_config
 from app.extensions.database import db_config
-from app.manager.node.enum import NodeStateEnum
+from app.server.node.enum import NodeStateEnum
 
 
 class Node(IdMixin, StatusMixin, BaseModel):
@@ -42,8 +42,8 @@ class Node(IdMixin, StatusMixin, BaseModel):
     advertise_address: Mapped[str | None] = mapped_column(
         String(255), nullable=True, comment="对外可达地址"
     )
-    agent_port: Mapped[int] = mapped_column(
-        Integer, default=app_config.AGENT_DEFAULT_PORT, comment="agent 端口"
+    worker_port: Mapped[int] = mapped_column(
+        Integer, default=app_config.WORKER_DEFAULT_PORT, comment="worker 端口"
     )
     token: Mapped[str] = mapped_column(String(64), comment="Bearer 鉴权令牌")
     state: Mapped[str] = mapped_column(

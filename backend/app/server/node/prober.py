@@ -1,4 +1,4 @@
-"""Node 主动 /healthz 探测循环（manager 进程内后台任务）。
+"""Node 主动 /healthz 探测循环（server 进程内后台任务）。
 
 契约记录：
 - /healthz 探测端点鉴权策略：按惯例豁免（liveness 探针暴露给 LB/监控，与 gpustack 一致），
@@ -14,9 +14,9 @@ import httpx
 
 from app.config import app_config
 from app.extensions.database import get_session_context
-from app.manager.node.enum import NodeStateEnum
-from app.manager.node.model import Node
-from app.manager.node.service import NodeService
+from app.server.node.enum import NodeStateEnum
+from app.server.node.model import Node
+from app.server.node.service import NodeService
 
 logger = logging.getLogger(__name__)
 
@@ -32,9 +32,9 @@ async def _probe_node(
         return
     if node.advertise_address:
         host = node.advertise_address
-        addr = host if ":" in host else f"{host}:{node.agent_port}"
+        addr = host if ":" in host else f"{host}:{node.worker_port}"
     else:
-        addr = f"{node.ip}:{node.agent_port}"
+        addr = f"{node.ip}:{node.worker_port}"
     url = f"http://{addr}/healthz"
     headers = {"Authorization": f"Bearer {node.token}"}
     try:

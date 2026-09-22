@@ -1,4 +1,4 @@
-"""Manager 模块 Node 公共 API（/vllm_manager/api/v1/nodes）。"""
+"""Server 模块 Node 公共 API（/vllm_manager/api/v1/nodes）。"""
 
 from typing import Annotated, Any
 
@@ -11,20 +11,20 @@ from app.base.base_response_schema import BaseResponse, EmptyResponse, PageRespo
 from app.config import app_config
 from app.exception import ForbiddenException, ResourceNotExistException
 from app.extensions.database import get_session
-from app.manager.node.dependencies import get_current_node
-from app.manager.node.enum import NodeStateEnum
-from app.manager.node.model import Node
-from app.manager.node.schema import (
+from app.server.node.dependencies import get_current_node
+from app.server.node.enum import NodeStateEnum
+from app.server.node.model import Node
+from app.server.node.schema import (
     NodeOut,
     NodeRegisterRequest,
     NodeRegisterResponse,
     NodeStatusReportRequest,
     NodeUpdateRequest,
 )
-from app.manager.node.service import NodeService
+from app.server.node.service import NodeService
 
 # 安全姿态（过渡期）：
-# 管理端点（list/get/patch/delete）当前暂未接入会话鉴权，仅 agent 端点
+# 管理端点（list/get/patch/delete）当前暂未接入会话鉴权，仅 worker 端点
 # （heartbeat/status/register 走节点 token）。管理端点开放是过渡姿态，待 web
 # 鉴权里程碑接入会话鉴权后收敛。部署约束：仅限内网/本机可达，禁止直接暴露公网。
 node_router = APIRouter(prefix="/nodes", tags=["节点管理"])
@@ -60,7 +60,7 @@ async def register_node(
         NodeRegisterResponse(
             node_id=node.id,
             token=node.token,
-            agent_port=node.agent_port,
+            worker_port=node.worker_port,
             heartbeat_interval=app_config.NODE_HEARTBEAT_INTERVAL,
         )
     )
@@ -72,7 +72,7 @@ async def node_heartbeat(
     current_node: Annotated[Node, Depends(get_current_node)],
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> BaseResponse[None]:
-    """节点心跳（agent 鉴权）。"""
+    """节点心跳（worker 鉴权）。"""
     if current_node.id != node_id:
         raise ForbiddenException("节点令牌与目标节点不匹配")
     node = await NodeService(session).heartbeat(node_id)
@@ -90,7 +90,7 @@ async def node_status_report(
     current_node: Annotated[Node, Depends(get_current_node)],
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> BaseResponse[None]:
-    """节点状态上报（agent 鉴权）。"""
+    """节点状态上报（worker 鉴权）。"""
     if current_node.id != node_id:
         raise ForbiddenException("节点令牌与目标节点不匹配")
     node = await NodeService(session).update_status(node_id, report)

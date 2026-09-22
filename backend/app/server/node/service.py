@@ -1,13 +1,13 @@
-"""Manager 模块 Node 服务层。"""
+"""Server 模块 Node 服务层。"""
 
 import secrets
 from datetime import datetime
 
 from app.base.base_crud import BaseCrudService
 from app.config import app_config
-from app.manager.node.enum import NodeStateEnum
-from app.manager.node.model import Node
-from app.manager.node.schema import NodeRegisterRequest, NodeStatusReportRequest
+from app.server.node.enum import NodeStateEnum
+from app.server.node.model import Node
+from app.server.node.schema import NodeRegisterRequest, NodeStatusReportRequest
 
 
 class NodeService(BaseCrudService[Node]):
@@ -30,14 +30,14 @@ class NodeService(BaseCrudService[Node]):
             node.hostname = data.hostname
             node.ip = data.ip
             node.advertise_address = data.advertise_address
-            node.agent_port = data.agent_port
+            node.worker_port = data.worker_port
         else:
             node = Node(
                 machine_id=data.machine_id,
                 hostname=data.hostname,
                 ip=data.ip,
                 advertise_address=data.advertise_address,
-                agent_port=data.agent_port,
+                worker_port=data.worker_port,
                 token=secrets.token_hex(32),
                 state=NodeStateEnum.PENDING.value,
             )
