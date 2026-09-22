@@ -1,0 +1,13 @@
+# BEGIN oh-my-opencode-slim clonedeps
+!.slim/
+!.slim/clonedeps.json
+!.slim/clonedeps/
+!.slim/clonedeps/repos/
+!.slim/clonedeps/repos/**
+.slim/clonedeps/repos/**/.git/
+.slim/clonedeps/repos/**/.git/**
+# END oh-my-opencode-slim clonedeps
+
+# Deepwork 进度文件（.gitignore 已忽略，这里放行让 OpenCode 可读）
+!.slim/deepwork/
+!.slim/deepwork/**

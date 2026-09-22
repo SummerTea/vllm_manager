@@ -1,0 +1,15 @@
+{
+  "version": "1.0.0",
+  "updatedAt": "2026-09-22T00:00:00.000Z",
+  "dependencies": [
+    {
+      "name": "gpustack",
+      "resolvedVersion": "v2.2.3",
+      "repoUrl": "https://github.com/gpustack/gpustack.git",
+      "ref": "v2.2.3",
+      "path": ".slim/clonedeps/repos/gpustack__gpustack",
+      "packagePath": "gpustack",
+      "reason": "GPU 集群管理 + vLLM 实例调度启停参考实现（worker/serve_manager.py、worker/backends/vllm.py 对标本项目的 agent 端）"
+    }
+  ]
+}

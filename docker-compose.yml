@@ -1,0 +1,42 @@
+# vllm_manager 依赖的中间件：PostgreSQL（业务数据）+ Redis（心跳/队列）
+#
+# 注意：本机已具备 PG（127.0.0.1:5432，postgres/123456）与 Redis
+# （127.0.0.1:6379，密码 123456）环境时，本文件可以完全跳过，直接
+# 启动应用即可。仅在没有 PG/Redis 的环境（如新机器/CI）才需要：
+#   docker compose up -d
+# 拉起后连接信息需与 .env 中 DB_URL / REDIS_URL 保持一致。
+services:
+  postgres:
+    image: postgres:16
+    container_name: vllm_manager_pg
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: vllm_manager
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d vllm_manager"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7
+    container_name: vllm_manager_redis
+    command: ["redis-server", "--requirepass", "123456"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "123456", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  pgdata:
+  redisdata:

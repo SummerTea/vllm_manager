@@ -1,0 +1,5 @@
+{
+  "includeIgnored": [
+    ".slim/clonedeps/repos/gpustack__gpustack/"
+  ]
+}
