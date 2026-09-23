@@ -7,15 +7,26 @@
 4. vram_claim/gmu 取值后交给 allocator 做 first-fit 决策
 5. 建记录（pending + target=starting），转发失败事务回滚无残留（路由层对
    VllmManagerException 统一 rollback，不写 error 状态）
+
+并发串行化：聚合 allocator 输入 → first_fit 决策 → 建记录并 flush 整体按事件循环
+加锁（_get_create_lock），防并发 create 读到彼此未落库记录造成超卖；候选/权重/
+转发等只读或网络步骤留在锁外。生产（PG）由事务级 advisory xact lock
+（pg_advisory_xact_lock）保证跨请求/跨事务串行，随事务提交/回滚自动释放，覆盖
+「锁内写、锁外提交」的 READ COMMITTED 可见性窗口；sqlite 测试走 asyncio.Lock。
 """
 
 import asyncio
 
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.base.base_crud import BaseCrudService
 from app.config import app_config
-from app.exception import ExternalServiceException, OperationNotAllowedException
+from app.exception import (
+    ExternalServiceException,
+    HttpClientException,
+    OperationNotAllowedException,
+)
 from app.server.allocator.schema import AllocationRejected, GPUResource, WorkerResource
 from app.server.allocator.service import AllocatorService
 from app.server.instance.base import estimate_vram_claim
@@ -34,6 +45,20 @@ class NodeReadOnlyCrud(BaseCrudService[Node]):
 
 class VllmInstanceReadOnlyCrud(BaseCrudService[VllmInstance]):
     """VllmInstance 只读查询（creation 与 VllmInstanceService 相互解耦，避免循环依赖）。"""
+
+
+# 并发 create 串行化锁：按事件循环懒建（模块级 asyncio.Lock() 会绑定创建时的
+# event loop，pytest 每用例新建 loop 时会报跨 loop 使用错误）。
+_create_locks: dict[asyncio.AbstractEventLoop, asyncio.Lock] = {}
+
+
+def _get_create_lock() -> asyncio.Lock:
+    loop = asyncio.get_running_loop()
+    lock = _create_locks.get(loop)
+    if lock is None:
+        lock = asyncio.Lock()
+        _create_locks[loop] = lock
+    return lock
 
 
 def _build_start_payload(inst: VllmInstance) -> dict:
@@ -129,65 +154,76 @@ async def create_vllm_instance(
         else app_config.INSTANCE_DEFAULT_GMU
     )
 
-    # 5. 聚合 allocator 输入（未停止实例占账合并）
-    instance_crud = VllmInstanceReadOnlyCrud(session)
-    workers: list[WorkerResource] = []
-    for node in candidates:
-        active = await instance_crud.get_list(
-            sa_filters=[
-                VllmInstance.node_id == node.id,
-                VllmInstance.state != InstanceStateEnum.STOPPED.value,
-            ]
-        )
-        merged: dict[int, int] = {}
-        for inst in active:
-            for raw_index, vram in (inst.allocated_vram or {}).items():
-                merged[int(raw_index)] = merged.get(int(raw_index), 0) + int(vram)
-        workers.append(
-            WorkerResource(
-                node_id=node.id,
-                gpu_devices=[
-                    GPUResource(
-                        index=g["index"],
-                        memory_total=g["memory_total"],
-                        gpu_type=g.get("name"),
-                    )
-                    for g in (node.status or {}).get("gpu_devices", [])
-                    if g.get("memory_total")
-                ],
-                system_reserved_vram=(node.system_reserved or {}).get("vram") or 0,
-                allocated_vram=merged,
+    # 5-7. 分配决策与建记录需串行化：聚合 allocator 输入 → first_fit 决策 → 建记录
+    # 并 flush 整体加锁，防并发 create 读到彼此尚未落库（或未提交）的记录造成超卖。
+    # 步骤 0-4（模板/候选/权重）与步骤 8（转发 start）留在锁外，避免持锁做网络 IO。
+    async with _get_create_lock():
+        # PG 事务级 advisory lock：跨请求/跨事务串行化，随事务提交/回滚自动释放，
+        # 覆盖「锁内写、锁外提交」导致的 READ COMMITTED 可见性窗口（Gate 1 P0-1）。
+        # sqlite 测试 dialect 非 postgresql → 跳过，仍走 asyncio.Lock 兜底。
+        if session.bind is not None and session.bind.dialect.name == "postgresql":
+            await session.execute(
+                select(func.pg_advisory_xact_lock(func.hashtext("vllm_create_alloc")))
             )
-        )
+        # 5. 聚合 allocator 输入（未停止实例占账合并）
+        instance_crud = VllmInstanceReadOnlyCrud(session)
+        workers: list[WorkerResource] = []
+        for node in candidates:
+            active = await instance_crud.get_list(
+                sa_filters=[
+                    VllmInstance.node_id == node.id,
+                    VllmInstance.state != InstanceStateEnum.STOPPED.value,
+                ]
+            )
+            merged: dict[int, int] = {}
+            for inst in active:
+                for raw_index, vram in (inst.allocated_vram or {}).items():
+                    merged[int(raw_index)] = merged.get(int(raw_index), 0) + int(vram)
+            workers.append(
+                WorkerResource(
+                    node_id=node.id,
+                    gpu_devices=[
+                        GPUResource(
+                            index=g["index"],
+                            memory_total=g["memory_total"],
+                            gpu_type=g.get("name"),
+                        )
+                        for g in (node.status or {}).get("gpu_devices", [])
+                        if g.get("memory_total")
+                    ],
+                    system_reserved_vram=(node.system_reserved or {}).get("vram") or 0,
+                    allocated_vram=merged,
+                )
+            )
 
-    # 6. allocator first-fit 决策
-    result = AllocatorService.first_fit(
-        workers, vram_claim, gmu, data.tensor_parallel_size
-    )
-    if isinstance(result, AllocationRejected):
-        raise OperationNotAllowedException(
-            "显存分配失败", operation="create", reason=result.reason
+        # 6. allocator first-fit 决策
+        result = AllocatorService.first_fit(
+            workers, vram_claim, gmu, data.tensor_parallel_size
         )
+        if isinstance(result, AllocationRejected):
+            raise OperationNotAllowedException(
+                "显存分配失败", operation="create", reason=result.reason
+            )
 
-    # 7. 建记录并 flush（template 快照固化；生成 id 供转发指令使用）
-    inst = VllmInstance(
-        node_id=result.node_id,
-        state=InstanceStateEnum.PENDING.value,
-        target_state=InstanceTargetStateEnum.STARTING.value,
-        gpu_indexes=result.gpu_indexes,
-        vram_claim=result.vram_claim,
-        allocated_vram=result.allocated_vram,
-        gpu_memory_utilization=result.gpu_memory_utilization,
-        tensor_parallel_size=data.tensor_parallel_size,
-        model_name=data.model_name,
-        task=data.task.value,
-        model_weight_bytes=model_weight_bytes,
-        args=data.args or [],
-        template=template,
-        restart_count=0,
-    )
-    session.add(inst)
-    await session.flush()
+        # 7. 建记录并 flush（template 快照固化；生成 id 供转发指令使用）
+        inst = VllmInstance(
+            node_id=result.node_id,
+            state=InstanceStateEnum.PENDING.value,
+            target_state=InstanceTargetStateEnum.STARTING.value,
+            gpu_indexes=result.gpu_indexes,
+            vram_claim=result.vram_claim,
+            allocated_vram=result.allocated_vram,
+            gpu_memory_utilization=result.gpu_memory_utilization,
+            tensor_parallel_size=data.tensor_parallel_size,
+            model_name=data.model_name,
+            task=data.task.value,
+            model_weight_bytes=model_weight_bytes,
+            args=data.args or [],
+            template=template,
+            restart_count=0,
+        )
+        session.add(inst)
+        await session.flush()
 
     # 8. 转发 start；失败包装抛 ExternalServiceException（不写 error——整事务由路由层回滚）
     target_node = next(n for n in candidates if n.id == result.node_id)
@@ -198,6 +234,9 @@ async def create_vllm_instance(
             f"instances/{inst.id}/start",
             json=_build_start_payload(inst),
         )
+    except HttpClientException:
+        # 1C：worker 非 2xx 错误码透传（HttpClientException 子类先行，保留语义）
+        raise
     except ExternalServiceException as e:
         raise ExternalServiceException(
             "启动指令转发失败",

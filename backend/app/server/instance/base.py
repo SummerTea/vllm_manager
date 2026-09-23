@@ -54,6 +54,9 @@ class InstanceLifecycleMixin:
     restart_count: Mapped[int] = mapped_column(
         Integer, default=0, comment="重启次数"
     )
+    target_retry_count: Mapped[int] = mapped_column(
+        Integer, default=0, comment="目标态指令重下发次数（对账收敛用）"
+    )
     is_active: Mapped[bool] = mapped_column(
         Boolean, default=True, comment="是否启用"
     )

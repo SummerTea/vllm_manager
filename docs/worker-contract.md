@@ -49,7 +49,8 @@ uvicorn app.worker.main:create_app --factory --host 0.0.0.0
                            │
 worker ──/instances/report 上报实际 state/port/restart_count──▶ server
                            │ 对账（apply_report）：更新 state、达成清 target、
-                           │ stopping 且上报消失→stopped、其余消失不动
+                           │ stopping 且上报消失→stopped、其余消失不动；
+                           │ stopping 且上报仍非 stopped → 限次重下发 stop（≤3）
                            ▼
                      target_state 清回 none（闭环完成）
 ```
@@ -192,10 +193,21 @@ worker ──/instances/report 上报实际 state/port/restart_count──▶ se
 2. **上报消失**：`target_state == stopping` 的实例收敛为 `stopped` + 清 target；
    **其余消失不动**（容忍 worker 重启窗口——重启期间 worker 内存态清空、无法上报，
    不能据此误判已停止）。
-3. **未知实例 id**：忽略（记 debug 日志），不影响其他条目。
+3. **停止指令未生效（悬挂收敛，server 侧限次重下发）**：`target_state == stopping`
+   但上报状态仍非 `stopped`（如 worker 崩溃恢复后容器仍 running、或 worker 停止
+   未确认）→ server **不**自动收敛 stopped，而是经 `request_to_worker` **重新下发
+   stop**（每轮对账至多 3 次，实例列 `target_retry_count` 计数）；超限后写
+   `state_message`「停止指令多次未生效，需人工介入」并保持 `target=stopping`
+   （绝不自动收敛——容器是否真正停止只能由 worker 确认）。
+4. **未知实例 id**：忽略（记 debug 日志），不影响其他条目。
 
 `is_target_achieved`：`target=starting` → `running` 或 `error` 视为达成（启动失败也是
 终态）；`target=stopping` → `stopped` 视为达成；`target=none` 恒达成。
+
+> **worker 侧配套（不谎报停止）**：worker `stop()` 在 `docker` 命令不可用（停止结果
+> 未知）时**不得**清除内存记录/meta 并静默消失——恢复调用前状态、保留 meta、返回
+> 非 2xx（server 透传失败信号），供上述对账重下发兜底；仅确认容器已停止/清理才清
+> 记录（`process_utils.stop_container` 返回 bool）。
 
 ## 2. server→worker 端点
 
@@ -217,7 +229,9 @@ worker ──/instances/report 上报实际 state/port/restart_count──▶ se
 - **语义**：拉起 vLLM 实例。**响应语义：2xx = 指令已受理（非实例已运行）**；
   实例最终状态由后续 `/instances/report` 对账收敛。
 - **非 2xx**：server 侧 `request_to_worker` 抛 `HttpClientException`（携带
-  `url`/`status_code`）。
+  `url`/`status_code`）；server 全局 handler 透传该 `status_code`（worker 401/403
+  映射为 502——避免前端把 server↔worker 鉴权失败误判为自身登录失效；其余 4xx/5xx
+  原样透出）。
 
 **请求体**（`creation.py:_build_start_payload` 生成，创建与手动启动复用）：
 
@@ -317,8 +331,12 @@ Phase B 容器化后走 docker run 模板渲染）：
   `docker rm` 清理容器；**绝不 killpg docker CLI 进程**（killpg 只杀 CLI 不杀容器，
   容器变孤儿）；随后清 worker 内存状态（容器/端口/退避计数）。幂等覆盖「容器不存在」
   场景（stop/kill/rm 对不存在容器均容错忽略）。
+- **docker 不可用不谎报停止**：`stop_container` 返回 `bool`——`docker` 命令无法执行
+  （缺失/超时/daemon 不可达）时停止结果未知，`stop()` **恢复调用前状态、保留记录与
+  meta、返回非 2xx**（500），绝不静默清除记录让实例从上报中消失（否则 server 误判
+  stopped → 容器成孤儿 + 显存账本漂移）；由 server 对账限次重下发兜底。
 - **幂等**：重复 stop（实例不存在/已停止/容器不存在）应返回 200 幂等，不报错。
-- 响应语义：2xx = 指令已受理。
+- 响应语义：2xx = 指令已受理；非 2xx = 停止未确认（server 对账重下发兜底）。
 
 ### 2.4 `POST /models/weight`
 
@@ -378,7 +396,8 @@ Phase B 容器化后走 docker run 模板渲染）：
 - **端口回填**：worker 分配端口后经 `/instances/report` 的 `port` 字段回传 server
   （server 端 `apply_report` 仅上报非 None 时更新 port）。
 - **与 server 对账联动**：worker 无主动拉取，只上报；server 侧节点失联时对
-  `running` 实例置 `unreachable`（不删除，人工介入），恢复后对账拉回。
+  `running` 实例置 `unreachable`（不删除，人工介入），恢复后对账拉回；
+  `target=stopping` 但上报仍非 stopped → server 限次重下发 stop（见 §1.4 规则 3）。
 
 ## 4. 鉴权与错误处理
 
@@ -434,7 +453,9 @@ worker 实现时需要感知：`WORKER_DEFAULT_PORT`（默认监听端口）、
 | stopping 过渡期上报 | worker 内存态有 STOPPING 但 `snapshot_for_report` 跳过；stop 完成清内存记录 → report 消失 → server 收敛 stopped | `lifecycle.py:snapshot_for_report` / `stop` |
 | GPU 优雅降级 | pynvml 不可用/无 GPU → 空 `gpu_devices` + 告警一次，绝不抛异常 | `collector.py:_collect_gpu_devices` |
 | docker 启动渲染 | 模板 `format_map` → `shlex.split` → argv 直传 Popen（**无 shell**）；`{args}`/`{env_args}`/`{mount_args}` 片段经 shlex.join 预 quote；用户可控占位值经 shlex.quote 防御 | `process_utils.py:render_docker_command`/`build_context` |
-| 容器停止 | `docker stop -t 3` → 超时/失败 `docker kill` → `docker rm`；**绝不 killpg docker CLI**（杀 CLI 不杀容器致孤儿）；stop/rm 对不存在容器容错 | `process_utils.py:stop_container` |
+| 容器停止 | `docker stop -t 3` → 超时/失败 `docker kill` → `docker rm`；**绝不 killpg docker CLI**（杀 CLI 不杀容器致孤儿）；stop/rm 对不存在容器容错；`stop_container` 返回 `bool`，docker 命令不可用（停止结果未知）→ `stop()` 恢复调用前状态、保留记录/meta、返回 500 不谎报停止（server 对账重下发兜底） | `process_utils.py:stop_container` / `lifecycle.py:stop` |
+| 停止悬挂收敛 | server `apply_report`：`target=stopping` 且上报非 stopped → 限次重下发 stop（`target_retry_count` ≤3，超限 `state_message` 告警、保持 target 不自动收敛）；start/stop 重置计数 | `service/instance.py:apply_report`、`base.py:InstanceLifecycleMixin.target_retry_count` |
+| 转发错误码透传 | server 全局 handler 透传 worker 非 2xx 的 `status_code`（401/403→502 防前端误判）；start/create 转发处先 `except HttpClientException: raise` 再包装传输错误 | `main/exceptions.py:http_client_exception_handler`、`service/instance.py:start`、`service/creation.py` |
 | restore 端口策略 | meta json（port/gpu_indexes/spec/model_path）+ `docker inspect`（State.Status==running）判定，**仅恢复 running** 复用原端口；探针异常保留 meta + 告警，容器不存在/非 running 删 meta | `lifecycle.py:restore` |
 | 模板快照 | start 指令 `StartRequest.template`（server `_build_start_payload` 顶层下发）→ worker 存入 `spec["template"]` 随 meta 持久化；退避重启/restore 复用同一模板；缺省用内置默认模板兜底（存量实例） | `lifecycle.py:start`/`_launch_container` |
 | 退避重启 | 首次 delay=0，之后 `min(10·2^(n-1), 300)`；拒启类（retryable=False）不自动重启；docker CLI 缺失（FileNotFoundError）→ retryable=False 永久化；**拉起前入口无条件 stop_container 清理同名残留容器**（防 Exited 残留 → 同名 docker run 冲突死循环，同时覆盖原 pre-kill） | `lifecycle.py:_maybe_restart`/`_launch_container` |
@@ -447,3 +468,8 @@ worker 实现时需要感知：`WORKER_DEFAULT_PORT`（默认监听端口）、
 - **starting 超时双阈值可调**：默认连续失败 N=2 ≈10s / 总时长 30s，当前为 worker
   `lifecycle.py` 模块常量（`_STARTUP_FAIL_THRESHOLD`/`_STARTUP_TIMEOUT_SECONDS`），
   如需运维可调可升配为 WorkerConfig 字段。
+
+> **升级注意（server 侧 schema）**：`vllm_manager_instance` 表新增 `target_retry_count`
+> 列（P0 整改）。项目无迁移链（`create_all` 仅建新表，sqlite 测试自动建表无影响）；
+> **升级需重建该表**——否则 PG 上实例域所有查询（含 list/详情）会因 column does not
+> exist 报错，且错误信息有误导性。

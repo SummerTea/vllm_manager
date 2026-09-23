@@ -29,6 +29,7 @@ from pathlib import Path
 
 import httpx
 
+from app.exception import ExternalServiceException
 from app.worker.config import WorkerConfig
 from app.worker.enum import WorkerInstanceStateEnum
 from app.worker.process_utils import (
@@ -335,17 +336,38 @@ class InstanceLifecycleManager:
         docker CLI**（会杀 CLI 不杀容器 → 容器变孤儿）；docker CLI 进程在容器停止后
         自然退出。清内存记录/端口/meta → report 消失 → server 收敛 stopped。
 
-        已知边缘（S9 注释，worker 侧仅记录）：worker 收到 stop 后未停容器即崩溃
-        → meta+容器存活 → 重启后 restore 报 running，server target=stopping 悬挂
-        ——属 server 侧收敛逻辑待补，worker 侧不处理。
+        **docker 不可用绝不谎报停止**：stop_container 返回 False（docker 命令缺失/
+        超时/daemon 不可达，停止结果未知）→ 恢复调用前状态 + 保留记录/meta/端口 +
+        抛 ExternalServiceException（worker JSON handler → 500，server 感知失败并
+        重下发）；若此时清记录，实例会从对账消失 → server 收敛 stopped → 显存账本
+        漂移/超卖。
+
+        已知边缘（S9）：worker 收到 stop 后未停容器即崩溃 → 重启后 restore 报 running
+        ——server 侧已实现「对账限次重下发 stop」收敛；worker 侧职责是 docker 不可用
+        时绝不谎报停止——保留记录与 meta 待重试。
         """
         async with self._lock:
             record = self._instances.get(instance_id)
             if record is None:
                 return {"status": "accepted"}
 
+            prev_state = record.state
             record.state = WorkerInstanceStateEnum.STOPPING
-            await asyncio.to_thread(stop_container, f"vllm-{instance_id}")
+            stopped = await asyncio.to_thread(stop_container, f"vllm-{instance_id}")
+            if not stopped:
+                # docker 不可用 → 停止结果未知：恢复可上报状态（STOPPING 在
+                # snapshot_for_report 中被跳过，保留会让实例从对账中消失），
+                # 保留记录/meta/端口待 server 对账限次重下发 stop；上抛让 server
+                # 感知失败（500），不得 pop 记录/删 meta/discard 端口
+                record.state = prev_state
+                record.state_message = "容器停止未确认（docker 不可用）"
+                logger.error(
+                    "实例 %s 容器停止未确认（docker 不可用），保留记录待重试",
+                    instance_id,
+                )
+                raise ExternalServiceException(
+                    "容器停止未确认（docker 不可用）", service_name="docker"
+                )
 
             self._instances.pop(instance_id, None)
             if record.port is not None:

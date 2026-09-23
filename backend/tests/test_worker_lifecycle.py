@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 
 import pytest
 
-from app.exception import NotFoundException
+from app.exception import ExternalServiceException, NotFoundException
 from app.worker.config import WorkerConfig
 from app.worker.enum import WorkerInstanceStateEnum
 from app.worker.lifecycle import InstanceLifecycleManager, WorkerInstanceRecord
@@ -20,9 +20,9 @@ def _cfg(**overrides) -> WorkerConfig:
     return WorkerConfig(**overrides)
 
 
-def _noop_stop_container(name: str) -> None:
-    """fixture 默认 stop_container mock：防测试触发真实 docker 命令。"""
-    return None
+def _noop_stop_container(name: str) -> bool:
+    """fixture 默认 stop_container mock：防测试触发真实 docker 命令（视为停止成功）。"""
+    return True
 
 
 def _start_request(**spec_overrides) -> StartRequest:
@@ -307,7 +307,7 @@ async def test_stop_terminates_and_cleans(manager, monkeypatch):
     monkeypatch.setattr("app.worker.lifecycle.get_free_port", lambda **kw: 18080)
     monkeypatch.setattr(
         "app.worker.lifecycle.stop_container",
-        lambda name: stopped.append(name),
+        lambda name: stopped.append(name) or True,
     )
 
     await manager.start("i-1", _start_request())
@@ -322,6 +322,56 @@ async def test_stop_terminates_and_cleans(manager, monkeypatch):
     assert "i-1" not in manager._instances
     assert 18080 not in manager._assigned_ports
     assert not meta_path.exists()
+
+
+async def test_stop_docker_unavailable_keeps_record_and_raises(manager, monkeypatch):
+    """docker 不可用（stop_container 返回 False）→ 不谎报停止：抛 ExternalServiceException、
+    记录保留且状态恢复调用前、meta 未删、端口未释放、快照仍含该实例（防对账收敛 stopped
+    → 显存账本漂移/超卖）。"""
+    monkeypatch.setattr("app.worker.lifecycle.subprocess.Popen", _FakePopenSimple)
+    monkeypatch.setattr("app.worker.lifecycle.get_free_port", lambda **kw: 18080)
+    await manager.start("i-1", _start_request())
+    rec = manager._instances["i-1"]
+    rec.state = WorkerInstanceStateEnum.RUNNING  # 调用前为可上报状态
+    meta_path = manager._config.WORKER_LOG_DIR / "instances" / "i-1.json"
+    assert meta_path.exists()
+
+    monkeypatch.setattr("app.worker.lifecycle.stop_container", lambda name: False)
+    with pytest.raises(ExternalServiceException):
+        await manager.stop("i-1")
+
+    # 记录仍在，状态恢复为调用前（RUNNING，STOPPING 不上报 → 必须恢复）
+    assert "i-1" in manager._instances
+    assert manager._instances["i-1"].state == WorkerInstanceStateEnum.RUNNING
+    assert "docker" in (manager._instances["i-1"].state_message or "")
+    assert meta_path.exists()  # meta 未删除
+    assert 18080 in manager._assigned_ports  # 端口未释放
+    items = await manager.snapshot_for_report()
+    assert "i-1" in [i["id"] for i in items]  # 快照再次包含该实例（可继续对账）
+
+
+async def test_launch_container_stop_false_ignored(manager, monkeypatch):
+    """_launch_container 入口 stop_container 返回 False（docker 不可用）→ 返回值被忽略，
+    不抛错、docker run 照常拉起（区别于 stop() 的守卫语义，入口清理仅是防同名冲突）。"""
+    captured: dict = {}
+
+    class _FakePopen:
+        def __init__(self, cmd, **kwargs):
+            captured["cmd"] = cmd
+            self.pid = 999
+            self._code = None
+
+        def poll(self):
+            return self._code
+
+    monkeypatch.setattr("app.worker.lifecycle.stop_container", lambda name: False)
+    monkeypatch.setattr("app.worker.lifecycle.subprocess.Popen", _FakePopen)
+    monkeypatch.setattr("app.worker.lifecycle.get_free_port", lambda **kw: 18080)
+
+    result = await manager.start("i-1", _start_request())
+    assert result == {"status": "accepted"}
+    assert manager._instances["i-1"].state == WorkerInstanceStateEnum.STARTING
+    assert captured["cmd"][0] == "docker" and captured["cmd"][1] == "run"
 
 
 # ---------- sync 状态机 ----------
@@ -556,6 +606,7 @@ async def test_restart_cleans_stale_container_first(manager, monkeypatch):
 
     def _fake_stop(name):
         calls.append("stop:" + name)
+        return True
 
     monkeypatch.setattr("app.worker.lifecycle.stop_container", _fake_stop)
     monkeypatch.setattr("app.worker.lifecycle.subprocess.Popen", _FakePopen)
@@ -725,6 +776,7 @@ async def test_start_concurrent_stop_no_resurrect(manager, monkeypatch):
         # 模拟锁释放窗口内 stop() 已删除记录并释放端口
         manager._instances.pop("i-1", None)
         manager._assigned_ports.discard(18080)
+        return True
 
     monkeypatch.setattr("app.worker.lifecycle.stop_container", _fake_stop)
     monkeypatch.setattr("app.worker.lifecycle.subprocess.Popen", _FakePopen)

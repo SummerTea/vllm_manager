@@ -240,7 +240,7 @@ def _fake_completed(returncode: int, stdout: str = "", stderr: str = ""):
 
 
 def test_stop_container_stop_failure_kill_then_rm(monkeypatch):
-    """stop 失败（非 0）→ 顺序 stop(-t 3) → kill → rm。"""
+    """stop 失败（非 0）→ 顺序 stop(-t 3) → kill → rm；inspect 确认已停止 → 返回 True。"""
     calls: list[list[str]] = []
 
     def _fake_run(cmd, **kwargs):
@@ -249,7 +249,12 @@ def test_stop_container_stop_failure_kill_then_rm(monkeypatch):
         return _fake_completed(code)
 
     monkeypatch.setattr("app.worker.process_utils.subprocess.run", _fake_run)
-    stop_container("vllm-i-1")
+    # inspect_container 单独 mock：聚焦 stop_container 判定语义（避免共享 subprocess.run）
+    monkeypatch.setattr(
+        "app.worker.process_utils.inspect_container",
+        lambda name: {"State": {"Status": "exited"}},
+    )
+    assert stop_container("vllm-i-1") is True
     assert calls == [
         ["docker", "stop", "-t", "3", "vllm-i-1"],
         ["docker", "kill", "vllm-i-1"],
@@ -258,7 +263,7 @@ def test_stop_container_stop_failure_kill_then_rm(monkeypatch):
 
 
 def test_stop_container_stop_ok_skips_kill(monkeypatch):
-    """stop 成功 → 跳过 kill，直接 rm。"""
+    """stop 成功 → 跳过 kill，直接 rm；inspect 确认容器不存在 → 返回 True。"""
     calls: list[list[str]] = []
 
     def _fake_run(cmd, **kwargs):
@@ -266,21 +271,51 @@ def test_stop_container_stop_ok_skips_kill(monkeypatch):
         return _fake_completed(0)
 
     monkeypatch.setattr("app.worker.process_utils.subprocess.run", _fake_run)
-    stop_container("vllm-i-1")
+    monkeypatch.setattr(
+        "app.worker.process_utils.inspect_container", lambda name: None
+    )
+    assert stop_container("vllm-i-1") is True
     assert calls == [
         ["docker", "stop", "-t", "3", "vllm-i-1"],
         ["docker", "rm", "vllm-i-1"],
     ]
 
 
-def test_stop_container_docker_missing_tolerated(monkeypatch):
-    """docker 命令缺失（FileNotFoundError）→ 容错不抛。"""
+def test_stop_container_docker_missing_returns_false(monkeypatch):
+    """docker 命令缺失（FileNotFoundError，_run 全 None）→ 停止结果未知，返回 False；
+    inspect 探针同样失败（raise）→ 无法确认。"""
 
     def _raise(cmd, **kwargs):
         raise FileNotFoundError()
 
+    def _raise_inspect(name):
+        raise FileNotFoundError()
+
     monkeypatch.setattr("app.worker.process_utils.subprocess.run", _raise)
-    stop_container("vllm-i-1")  # 不抛
+    monkeypatch.setattr("app.worker.process_utils.inspect_container", _raise_inspect)
+    assert stop_container("vllm-i-1") is False  # 不抛，但不得按已停止收敛
+
+
+def test_stop_container_rm_failed_still_running_returns_false(monkeypatch):
+    """P1-2：stop/kill/rm 均执行但全部非零（运行中容器不可 rm）→ inspect 确认仍
+    running → 返回 False，不得按已停止收敛（防显存账本漂移）。"""
+    calls: list[list[str]] = []
+
+    def _fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return _fake_completed(1)  # stop/kill/rm 均失败（容器仍运行）
+
+    monkeypatch.setattr("app.worker.process_utils.subprocess.run", _fake_run)
+    monkeypatch.setattr(
+        "app.worker.process_utils.inspect_container",
+        lambda name: {"State": {"Status": "running"}},
+    )
+    assert stop_container("vllm-i-1") is False
+    assert calls == [
+        ["docker", "stop", "-t", "3", "vllm-i-1"],
+        ["docker", "kill", "vllm-i-1"],
+        ["docker", "rm", "vllm-i-1"],
+    ]
 
 
 # ---------- inspect_container ----------
@@ -407,7 +442,8 @@ def test_render_args_with_braces_ok(tmp_path):
 
 
 def test_stop_container_timeout_tolerated(monkeypatch):
-    """S7：docker stop 超时 → 容错跳过（返回 None 触发 kill 兜底），不中断流程。"""
+    """S7：docker stop 超时 → 容错跳过（返回 None 触发 kill 兜底），不中断流程；
+    kill/rm 可执行 + inspect 确认已停止 → 返回 True。"""
     calls: list[list[str]] = []
 
     def _fake_run(cmd, **kwargs):
@@ -417,12 +453,31 @@ def test_stop_container_timeout_tolerated(monkeypatch):
         return _fake_completed(0)
 
     monkeypatch.setattr("app.worker.process_utils.subprocess.run", _fake_run)
-    stop_container("vllm-i-1")  # 不抛
+    monkeypatch.setattr(
+        "app.worker.process_utils.inspect_container",
+        lambda name: {"State": {"Status": "exited"}},
+    )
+    assert stop_container("vllm-i-1") is True  # stop 超时但 kill/rm 成功 + 确认停止 → 结果已知
     assert calls == [
         ["docker", "stop", "-t", "3", "vllm-i-1"],
         ["docker", "kill", "vllm-i-1"],  # stop 超时（None）→ kill 兜底
         ["docker", "rm", "vllm-i-1"],
     ]
+
+
+def test_stop_container_daemon_unreachable_returns_false(monkeypatch):
+    """docker daemon 不可达（OSError，_run 全 None）→ 停止结果未知，返回 False；
+    inspect 探针同样失败（raise）→ 无法确认。"""
+
+    def _raise(cmd, **kwargs):
+        raise OSError("Cannot connect to the Docker daemon")
+
+    def _raise_inspect(name):
+        raise RuntimeError("Cannot connect to the Docker daemon")
+
+    monkeypatch.setattr("app.worker.process_utils.subprocess.run", _raise)
+    monkeypatch.setattr("app.worker.process_utils.inspect_container", _raise_inspect)
+    assert stop_container("vllm-i-1") is False  # 不抛，但不得按已停止收敛
 
 
 def test_render_multi_word_vllm_bin(tmp_path):

@@ -14,6 +14,7 @@ from app.config import app_config
 from app.exception import (
     BusinessException,
     DuplicateResourceException,
+    HttpClientException,
     HttpException,
     ResourceNotExistException,
     VllmManagerException,
@@ -210,6 +211,26 @@ def register_exception_handlers(app: FastAPI):
             status_code=500,
             message=exc.message,
             code=500,
+            error_code=exc.code,
+            details=exc.details,
+        )
+
+    @app.exception_handler(HttpClientException)
+    async def http_client_exception_handler(request: Request, exc: HttpClientException):
+        """处理 worker 转发错误：透传 worker 状态码，避免恒 500 丢失 4xx 语义。
+
+        worker 401/403 → 502：worker 鉴权失败不代表 server 侧前端登录失效，
+        映射为 502 防前端误判自身登录态被踢。
+        """
+        raw = (exc.details or {}).get("status_code") or 502
+        status_code = 502 if raw in (401, 403) else int(raw)
+        if not _is_api_request(request):
+            return _html_error_response(status_code, SAFE_INTERNAL_ERROR_MESSAGE)
+        return _api_error_response(
+            request=request,
+            status_code=status_code,
+            message=exc.message,
+            code=status_code,
             error_code=exc.code,
             details=exc.details,
         )

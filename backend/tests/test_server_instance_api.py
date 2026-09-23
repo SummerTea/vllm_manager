@@ -14,6 +14,7 @@ from fastapi.testclient import TestClient
 
 import app.server.instance.model  # noqa: F401  (注册 VllmInstance 到 Base.metadata)
 import app.server.node.model  # noqa: F401  (注册 Node 到 Base.metadata)
+from app.exception import HttpClientException
 from app.extensions.database import get_session
 from app.main import app
 from app.server.instance.enum import InstanceStateEnum
@@ -234,6 +235,75 @@ def test_delete_then_404(api_client, monkeypatch):
 
     got = api_client.get(f"{_BASE}/{inst['id']}")
     assert got.status_code == 404
+
+
+def test_delete_stop_forward_failure_blocks(api_client, monkeypatch):
+    """1B-2：删除非 stopped 实例时 stop 转发失败 → API 返回错误响应且记录仍在。"""
+    node = _ready_node(api_client)
+    inst = _create(api_client, monkeypatch)
+    _report_state(api_client, node, inst["id"], "running")
+
+    async def fake_request_to_worker(node, method, path, **kwargs):
+        raise HttpClientException(
+            "worker 拒绝停止", url="http://10.0.0.1:8100", status_code=500
+        )
+
+    monkeypatch.setattr(
+        "app.server.instance.service.instance.request_to_worker",
+        fake_request_to_worker,
+    )
+
+    resp = api_client.delete(f"{_BASE}/{inst['id']}")
+    assert resp.status_code == 500
+    assert "已阻断删除" in resp.json()["message"]
+
+    # 记录未被物理删除
+    got = api_client.get(f"{_BASE}/{inst['id']}")
+    assert got.status_code == 200
+
+
+def test_create_forward_worker_404_passthrough(api_client, monkeypatch):
+    """1C：create 转发 start 时 worker 返回 404 → server 透传 404（而非恒 500）。"""
+    _ready_node(api_client)
+
+    async def fake_request_to_worker(node, method, path, **kwargs):
+        if path == "models/weight":
+            return FakeResponse({"weight_bytes": 2 * _GIB})
+        raise HttpClientException(
+            "worker 404", url="http://10.0.0.1:8100", status_code=404
+        )
+
+    monkeypatch.setattr(
+        "app.server.instance.service.creation.request_to_worker",
+        fake_request_to_worker,
+    )
+
+    resp = api_client.post(_BASE, json={"model_name": "qwen2.5"})
+    assert resp.status_code == 404
+    body = resp.json()
+    assert body["data"]["error_code"] == "HTTP_CLIENT_ERROR"
+    assert body["data"]["details"]["status_code"] == 404
+
+
+def test_create_forward_worker_401_becomes_502(api_client, monkeypatch):
+    """1C：worker 返回 401（worker 鉴权失败）→ server 响应 502，避免前端误判自身登录失效。"""
+    _ready_node(api_client)
+
+    async def fake_request_to_worker(node, method, path, **kwargs):
+        if path == "models/weight":
+            return FakeResponse({"weight_bytes": 2 * _GIB})
+        raise HttpClientException(
+            "worker 401", url="http://10.0.0.1:8100", status_code=401
+        )
+
+    monkeypatch.setattr(
+        "app.server.instance.service.creation.request_to_worker",
+        fake_request_to_worker,
+    )
+
+    resp = api_client.post(_BASE, json={"model_name": "qwen2.5"})
+    assert resp.status_code == 502
+    assert resp.json()["data"]["details"]["status_code"] == 401
 
 
 def test_report_requires_token(api_client):

@@ -226,11 +226,19 @@ def render_docker_command(template: str, context: dict[str, str]) -> list[str]:
     return shlex.split(rendered)
 
 
-def stop_container(container_name: str) -> None:
-    """停止并清理容器：`docker stop -t 3` →（stop 失败时 `docker kill`）→ `docker rm`。
+def stop_container(container_name: str) -> bool:
+    """停止并清理容器：`docker stop -t 3` →（stop 失败时 `docker kill`）→ `docker rm`，
+    最后 `docker inspect` 确认容器已不再运行。
 
     **绝不 killpg docker CLI 进程**——killpg 只杀 CLI 不杀容器，容器变孤儿；
     容器必须走 docker 命令。docker 命令缺失/容器不存在等一律容错不抛。
+
+    返回语义（True=已确认不再运行；False=仍在运行或无法确认）：
+    - `True`：`docker inspect` 确认容器不存在，或状态非 running（Exited/dead/
+      stopped 等）——容器已确认不再运行。
+    - `False`：stop/kill/rm 尽力执行后 inspect 仍 running（容器仍在运行），或
+      docker 无法确认（命令缺失/daemon 不可达/超时/探针异常）→ 调用方**不得**
+      按已停止收敛（防显存账本漂移）。
     """
     def _run(cmd: list[str]) -> subprocess.CompletedProcess | None:
         try:
@@ -248,8 +256,19 @@ def stop_container(container_name: str) -> None:
     stop_proc = _run(["docker", "stop", "-t", "3", container_name])
     if stop_proc is None or stop_proc.returncode != 0:
         # stop 失败或状态未知（超时/异常/容器已停）→ kill 强杀兜底
-        _run(["docker", "kill", container_name])
+        kill_proc = _run(["docker", "kill", container_name])
+        if stop_proc is None and kill_proc is None:
+            return False  # docker 命令完全不可用，停止结果未知
     _run(["docker", "rm", container_name])  # 清理容器（对不存在容器容错）
+
+    # 结果确认：复用 inspect_container 三态语义（None=容器不存在 / raise=探针异常）
+    try:
+        inspected = inspect_container(container_name)
+    except Exception:  # noqa: BLE001 - 探针异常（docker 缺失/daemon 不可达/超时/解析失败）→ 无法确认
+        return False
+    if inspected is None:
+        return True  # 容器不存在 → 已停止
+    return inspected.get("State", {}).get("Status") != "running"
 
 
 def inspect_container(container_name: str) -> dict | None:

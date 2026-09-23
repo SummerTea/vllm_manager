@@ -8,6 +8,9 @@ create_all 建表。
 
 from typing import Any
 
+import asyncio
+import logging
+
 import pytest
 
 import app.server.instance.model  # noqa: F401  (注册 VllmInstance 到 Base.metadata)
@@ -15,6 +18,7 @@ import app.server.node.model  # noqa: F401  (注册 Node 到 Base.metadata)
 from app.exception import (
     ConflictException,
     ExternalServiceException,
+    HttpClientException,
     InvalidStateException,
     OperationNotAllowedException,
     ResourceNotExistException,
@@ -37,6 +41,10 @@ from app.server.instance.schema import (
     VllmInstanceCreateRequest,
 )
 from app.server.instance.service import VllmInstanceService
+from app.server.instance.service.instance import (
+    _MAX_STOP_REDISPATCH,
+    _pending_redispatch_tasks,
+)
 from app.server.instance.service.start_template import (
     DEFAULT_VLLM_RUN_TEMPLATE,
     seed_start_templates,
@@ -114,6 +122,16 @@ async def _create_ready_instance(session, monkeypatch, **overrides) -> VllmInsta
     data: dict[str, Any] = {"model_name": "qwen2.5"}
     data.update(overrides)
     return await VllmInstanceService(session).create(VllmInstanceCreateRequest(**data))
+
+
+async def _drain_redispatch_tasks() -> None:
+    """等待模块级 fire-and-forget stop 重下发任务全部完成（done 回调自动清空集合）。
+
+    用于对「实际转发被调用」做同步断言：apply_report 只记账并派发后台任务，转发
+    在端点返回后才执行，测试需把控制权交还事件循环直至任务完成。
+    """
+    while _pending_redispatch_tasks:
+        await asyncio.gather(*list(_pending_redispatch_tasks))
 
 
 # ---------- base 纯函数 ----------
@@ -515,6 +533,82 @@ async def test_create_forward_failure_rolls_back(session, monkeypatch):
     assert found is None
 
 
+async def test_concurrent_create_serialized_no_oversell(session, monkeypatch):
+    """1B-3：并发 create 串行化——同一节点单卡只有一个卡位可容纳时，
+    asyncio.gather 并发两个 create 不发生超卖（恰一个成功，另一个被 allocator 拒绝）。"""
+    await _ready_node(session)
+
+    async def fake_request_to_worker(node, method, path, **kwargs):
+        return FakeResponse({"weight_bytes": 2 * _GIB})
+
+    monkeypatch.setattr(
+        "app.server.instance.service.creation.request_to_worker",
+        fake_request_to_worker,
+    )
+
+    async def create_one():
+        return await VllmInstanceService(session).create(
+            VllmInstanceCreateRequest(model_name="qwen2.5")
+        )
+
+    results = await asyncio.gather(create_one(), create_one(), return_exceptions=True)
+
+    successes = [r for r in results if isinstance(r, VllmInstance)]
+    rejected = [r for r in results if isinstance(r, OperationNotAllowedException)]
+    assert len(successes) == 1, results
+    assert len(rejected) == 1, results
+    # 串行化后无超卖：库内恰一条实例（第二个被 allocator 拒绝，未产生占账记录）
+    total = await VllmInstanceService(session).count()
+    assert total == 1
+
+
+async def test_create_acquires_pg_advisory_lock(session, monkeypatch):
+    """P0-1 回归：PG dialect 下 create 临界区开头执行事务级 advisory xact lock，
+    跨请求/跨事务串行化（覆盖「锁内写、锁外提交」的 READ COMMITTED 可见性窗口）。
+
+    sqlite 无法执行 pg_advisory_xact_lock（函数不存在），测试伪造 PG dialect 触发
+    分支，并包裹 session.execute：advisory 语句只验证调用序列，其余走真实执行。
+    """
+    await _ready_node(session)
+
+    async def fake_request_to_worker(node, method, path, **kwargs):
+        return FakeResponse({"weight_bytes": 2 * _GIB})
+
+    monkeypatch.setattr(
+        "app.server.instance.service.creation.request_to_worker",
+        fake_request_to_worker,
+    )
+
+    # 伪造 PG dialect：触发 advisory lock 分支
+    class FakeDialect:
+        name = "postgresql"
+
+    class FakeBind:
+        dialect = FakeDialect()
+
+    monkeypatch.setattr(session, "bind", FakeBind())
+
+    real_execute = session.execute
+    seen_sql: list[str] = []
+
+    async def tracking_execute(stmt, *args, **kwargs):
+        sql = str(stmt)
+        seen_sql.append(sql)
+        if "pg_advisory_xact_lock" in sql:
+            # sqlite 无该函数，仅验证调用序列，跳过真实执行
+            return None
+        return await real_execute(stmt, *args, **kwargs)
+
+    monkeypatch.setattr(session, "execute", tracking_execute)
+
+    inst = await VllmInstanceService(session).create(
+        VllmInstanceCreateRequest(model_name="qwen2.5")
+    )
+    assert inst.id
+    # create 全程恰好执行一次 advisory lock（其余查询不受影响）
+    assert [s for s in seen_sql if "pg_advisory_xact_lock" in s], seen_sql
+
+
 async def test_create_specified_node_unavailable(session, monkeypatch):
     await _ready_node(session)
     with pytest.raises(OperationNotAllowedException) as excinfo:
@@ -630,6 +724,38 @@ async def test_stop_stopped_instance_rejected(session, monkeypatch):
         await VllmInstanceService(session).stop(inst.id)
 
 
+async def test_start_stop_reset_target_retry_count(session, monkeypatch):
+    """1B-1：start()/stop() 写 target_state 时重置 target_retry_count（用户操作重置预算）。"""
+    node = await _ready_node(session)
+    inst = await _create_ready_instance(session, monkeypatch)
+    inst.state = InstanceStateEnum.STOPPED.value
+    inst.target_state = InstanceTargetStateEnum.NONE.value
+    inst.target_retry_count = _MAX_STOP_REDISPATCH  # 模拟对账已把预算耗尽
+    await session.flush()
+
+    async def fake_request_to_worker(node, method, path, **kwargs):
+        return FakeResponse()
+
+    monkeypatch.setattr(
+        "app.server.instance.service.instance.request_to_worker",
+        fake_request_to_worker,
+    )
+
+    # start 重置预算
+    out = await VllmInstanceService(session).start(inst.id)
+    assert out.target_retry_count == 0
+    assert out.target_state == InstanceTargetStateEnum.STARTING.value
+
+    # stop 重置预算
+    out.state = InstanceStateEnum.RUNNING.value
+    out.target_state = InstanceTargetStateEnum.NONE.value
+    out.target_retry_count = _MAX_STOP_REDISPATCH
+    await session.flush()
+    out = await VllmInstanceService(session).stop(out.id)
+    assert out.target_retry_count == 0
+    assert out.target_state == InstanceTargetStateEnum.STOPPING.value
+
+
 # ---------- delete ----------
 
 
@@ -655,6 +781,35 @@ async def test_delete_active_instance_stops_then_deletes(session, monkeypatch):
     assert calls == [f"instances/{inst.id}/stop"]
     got = await VllmInstanceService(session).get_by_id(inst.id)
     assert got is None
+
+
+async def test_delete_active_stop_failure_blocks_delete(session, monkeypatch):
+    """1B-2：删除非 stopped 实例时 stop 转发失败 → 抛异常阻断物理删除，记录仍存在。"""
+    await _ready_node(session)
+    inst = await _create_ready_instance(session, monkeypatch)
+    inst.state = InstanceStateEnum.RUNNING.value
+    await session.flush()
+
+    async def fake_request_to_worker(node, method, path, **kwargs):
+        # worker 返回 500（HttpClientException 为 ExternalServiceException 子类，
+        # 与规格一致会被 except ExternalServiceException 捕获并转成阻断异常）
+        raise HttpClientException(
+            "worker 拒绝停止", url="http://10.0.0.1:8100", status_code=500
+        )
+
+    monkeypatch.setattr(
+        "app.server.instance.service.instance.request_to_worker",
+        fake_request_to_worker,
+    )
+
+    with pytest.raises(ExternalServiceException) as excinfo:
+        await VllmInstanceService(session).delete(inst.id)
+    assert "已阻断删除" in excinfo.value.message
+    assert excinfo.value.details["instance_id"] == inst.id
+
+    # 记录未被物理删除
+    got = await VllmInstanceService(session).get_by_id(inst.id)
+    assert got is not None
 
 
 # ---------- apply_report 对账 ----------
@@ -697,21 +852,186 @@ async def test_apply_report_keeps_stopping_target_on_running_report(session, mon
     inst.target_state = InstanceTargetStateEnum.STOPPING.value
     await session.flush()
 
+    calls = []
+
+    async def fake_request_to_worker(node, method, path, **kwargs):
+        calls.append(path)
+        return FakeResponse()
+
+    monkeypatch.setattr(
+        "app.server.instance.service.instance.request_to_worker",
+        fake_request_to_worker,
+    )
+
     report = InstanceReportRequest(
         items=[
             InstanceReportItem(id=inst.id, state=InstanceStateEnum.RUNNING)
         ]
     )
     count = await VllmInstanceService(session).apply_report(node.id, report)
+    await _drain_redispatch_tasks()  # fire-and-forget：等待后台重下发任务完成
 
     assert count == 1
     assert inst.state == InstanceStateEnum.RUNNING.value
     assert inst.target_state == InstanceTargetStateEnum.STOPPING.value  # 保留，不释放占账
-    # 模拟下轮上报消失 → 命中 target=stopping 收敛为 stopped
+    assert inst.target_retry_count == 1  # 记账同步可见
+    assert inst.state_message == f"停止指令未生效，已重新下发停止（第 {inst.target_retry_count} 次）"
+    # 悬挂收敛：stop 未生效仍上报 running → 触发一次 stop 重下发
+    assert calls == [f"instances/{inst.id}/stop"]
+    # 模拟下轮上报消失 → 命中 target=stopping 收敛为 stopped（清残留告警文案与预算）
     await VllmInstanceService(session).apply_report(
         node.id, InstanceReportRequest(items=[])
     )
     assert inst.state == InstanceStateEnum.STOPPED.value
+    assert inst.state_message is None
+    assert inst.target_retry_count == 0
+
+
+async def test_apply_report_stopping_redispatch_limited(session, monkeypatch):
+    """1B-1：target=stopping + 上报 running → 对账限次重下发 stop；target 保持 stopping、
+    state 不收敛为 stopped、target_retry_count 递增；超限置人工介入告警且不再转发。"""
+    node = await _ready_node(session)
+    inst = await _create_ready_instance(session, monkeypatch)
+    inst.state = InstanceStateEnum.RUNNING.value
+    inst.target_state = InstanceTargetStateEnum.STOPPING.value
+    inst.target_retry_count = 0
+    await session.flush()
+
+    calls = []
+
+    async def fake_request_to_worker(node, method, path, **kwargs):
+        calls.append(path)
+        return FakeResponse()
+
+    monkeypatch.setattr(
+        "app.server.instance.service.instance.request_to_worker",
+        fake_request_to_worker,
+    )
+
+    report = InstanceReportRequest(
+        items=[InstanceReportItem(id=inst.id, state=InstanceStateEnum.RUNNING)]
+    )
+    # 未超限：每轮重下发一次 stop，state 不收敛为 stopped
+    for round_no in range(1, _MAX_STOP_REDISPATCH + 1):
+        count = await VllmInstanceService(session).apply_report(node.id, report)
+        await _drain_redispatch_tasks()  # fire-and-forget：等待后台重下发任务完成
+        assert count == 1
+        assert inst.target_retry_count == round_no
+        assert inst.state_message == (
+            f"停止指令未生效，已重新下发停止（第 {round_no} 次）"
+        )
+        assert inst.target_state == InstanceTargetStateEnum.STOPPING.value
+        assert inst.state == InstanceStateEnum.RUNNING.value
+    assert len(calls) == _MAX_STOP_REDISPATCH
+
+    # 超限：不再转发，置人工介入告警；target/state 保持（绝不自动收敛 stopped）
+    await VllmInstanceService(session).apply_report(node.id, report)
+    await _drain_redispatch_tasks()
+    assert inst.target_retry_count == _MAX_STOP_REDISPATCH
+    assert inst.target_state == InstanceTargetStateEnum.STOPPING.value
+    assert inst.state == InstanceStateEnum.RUNNING.value
+    assert inst.state_message == "停止指令多次未生效，需人工介入"
+    assert len(calls) == _MAX_STOP_REDISPATCH
+
+
+async def test_apply_report_stopping_redispatch_failure_keeps_retrying(session, monkeypatch):
+    """1B-1：重下发 stop 转发失败只记 warning 置记账 message，不打断本次对账，下轮继续重试。"""
+    node = await _ready_node(session)
+    inst = await _create_ready_instance(session, monkeypatch)
+    inst.state = InstanceStateEnum.RUNNING.value
+    inst.target_state = InstanceTargetStateEnum.STOPPING.value
+    await session.flush()
+
+    async def fake_request_to_worker(node, method, path, **kwargs):
+        raise ExternalServiceException("worker 不可达", service_name="worker")
+
+    monkeypatch.setattr(
+        "app.server.instance.service.instance.request_to_worker",
+        fake_request_to_worker,
+    )
+
+    report = InstanceReportRequest(
+        items=[InstanceReportItem(id=inst.id, state=InstanceStateEnum.RUNNING)]
+    )
+    count = await VllmInstanceService(session).apply_report(node.id, report)
+    await _drain_redispatch_tasks()  # fire-and-forget：等待后台任务（失败仅 warning）
+
+    assert count == 1  # 对账本身不失败
+    assert inst.target_retry_count == 1  # 记账同步可见（仍计入重试次数，下轮继续）
+    assert inst.target_state == InstanceTargetStateEnum.STOPPING.value
+    # 转发失败不改变记账 message（失败仅 warning，留待下轮对账重试）
+    assert inst.state_message == f"停止指令未生效，已重新下发停止（第 {inst.target_retry_count} 次）"
+
+    # 下轮对账：继续计数重试（预算未因失败而消耗到人工介入）
+    count = await VllmInstanceService(session).apply_report(node.id, report)
+    await _drain_redispatch_tasks()
+    assert count == 1
+    assert inst.target_retry_count == 2
+    assert inst.state_message == "停止指令未生效，已重新下发停止（第 2 次）"
+
+
+async def test_apply_report_redispatch_task_failure_logged_only(session, monkeypatch, caplog):
+    """P1-1：后台 stop 重下发任务失败仅 warning——apply_report 不抛、对账不受影响、
+    模块级 pending 集合正常清空（异常不外泄到事件循环）。"""
+    node = await _ready_node(session)
+    inst = await _create_ready_instance(session, monkeypatch)
+    inst.state = InstanceStateEnum.RUNNING.value
+    inst.target_state = InstanceTargetStateEnum.STOPPING.value
+    await session.flush()
+
+    async def fake_request_to_worker(node, method, path, **kwargs):
+        raise ExternalServiceException("worker 不可达", service_name="worker")
+
+    monkeypatch.setattr(
+        "app.server.instance.service.instance.request_to_worker",
+        fake_request_to_worker,
+    )
+
+    report = InstanceReportRequest(
+        items=[InstanceReportItem(id=inst.id, state=InstanceStateEnum.RUNNING)]
+    )
+    with caplog.at_level(
+        logging.WARNING, logger="app.server.instance.service.instance"
+    ):
+        count = await VllmInstanceService(session).apply_report(node.id, report)
+        await _drain_redispatch_tasks()
+
+    assert count == 1
+    assert inst.target_retry_count == 1
+    assert any("对账重下发 stop 失败" in r.message for r in caplog.records)
+    assert not _pending_redispatch_tasks  # 任务完成并已从模块级集合清空
+
+
+async def test_apply_report_redispatch_skipped_when_node_missing(session, monkeypatch):
+    """P2-3：实例所在节点已不存在 → 不计数、不调度（重下发预算不浪费）。"""
+    await _ready_node(session)
+    inst = await _create_ready_instance(session, monkeypatch)
+    inst.state = InstanceStateEnum.RUNNING.value
+    inst.target_state = InstanceTargetStateEnum.STOPPING.value
+    inst.node_id = "no-such-node"  # 模拟节点已被删除
+    await session.flush()
+
+    calls = []
+
+    async def fake_request_to_worker(node, method, path, **kwargs):
+        calls.append(path)
+        return FakeResponse()
+
+    monkeypatch.setattr(
+        "app.server.instance.service.instance.request_to_worker",
+        fake_request_to_worker,
+    )
+
+    report = InstanceReportRequest(
+        items=[InstanceReportItem(id=inst.id, state=InstanceStateEnum.RUNNING)]
+    )
+    count = await VllmInstanceService(session).apply_report("no-such-node", report)
+    await _drain_redispatch_tasks()
+
+    assert count == 1
+    assert inst.target_retry_count == 0  # 不计数
+    assert inst.state_message is None  # 不写记账 message
+    assert calls == []  # 不调度转发
 
 
 async def test_apply_report_stopped_not_revived_by_late_running_report(session, monkeypatch):
@@ -749,6 +1069,8 @@ async def test_apply_report_missing_with_target_stopping(session, monkeypatch):
     node = await _ready_node(session)
     inst = await _create_ready_instance(session, monkeypatch)
     inst.target_state = InstanceTargetStateEnum.STOPPING.value
+    inst.state_message = "停止指令未生效，已重新下发停止（第 2 次）"
+    inst.target_retry_count = 2
     await session.flush()
 
     count = await VllmInstanceService(session).apply_report(
@@ -758,6 +1080,9 @@ async def test_apply_report_missing_with_target_stopping(session, monkeypatch):
     assert count == 0
     assert inst.state == InstanceStateEnum.STOPPED.value
     assert inst.target_state == InstanceTargetStateEnum.NONE.value
+    # P2-1：收敛 stopped 同时清残留告警文案与重下发预算
+    assert inst.state_message is None
+    assert inst.target_retry_count == 0
 
 
 async def test_apply_report_missing_without_stopping_target(session, monkeypatch):
