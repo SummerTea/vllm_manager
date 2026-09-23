@@ -17,6 +17,7 @@ from app.exception import (
     ExternalServiceException,
     InvalidStateException,
     OperationNotAllowedException,
+    ResourceNotExistException,
 )
 from app.server.instance.base import (
     apply_report,
@@ -36,6 +37,10 @@ from app.server.instance.schema import (
     VllmInstanceCreateRequest,
 )
 from app.server.instance.service import VllmInstanceService
+from app.server.instance.service.start_template import (
+    DEFAULT_VLLM_RUN_TEMPLATE,
+    seed_start_templates,
+)
 from app.server.node.model import Node
 from app.server.node.schema import (
     GPUDeviceStatus,
@@ -335,6 +340,7 @@ async def test_create_success(session, monkeypatch):
     assert payload["instance_type"] == "vllm"
     assert payload["gpu_indexes"] == [0]
     assert payload["vram_claim"] == inst.vram_claim
+    assert payload["template"] == inst.template
     assert payload["spec"] == {
         "model_name": "qwen2.5",
         "task": "auto",
@@ -342,6 +348,48 @@ async def test_create_success(session, monkeypatch):
         "tensor_parallel_size": 1,
         "args": [],
     }
+
+
+async def test_create_snapshots_default_template(session, monkeypatch):
+    """create 缺省 template_key：快照默认模板内容（seed 后为 vllm-default）。"""
+    await seed_start_templates(session)
+    await _ready_node(session)
+
+    inst = await _create_ready_instance(session, monkeypatch)
+
+    assert inst.template is not None
+    assert "docker run" in inst.template
+    assert inst.template == DEFAULT_VLLM_RUN_TEMPLATE
+
+
+async def test_create_snapshots_specified_template(session, monkeypatch):
+    """create 指定 template_key：快照对应模板内容。"""
+    await seed_start_templates(session)
+    await _ready_node(session)
+
+    inst = await _create_ready_instance(
+        session, monkeypatch, template_key="vllm-gpus-env"
+    )
+
+    assert inst.template is not None
+    assert "NVIDIA_VISIBLE_DEVICES" in inst.template
+
+
+async def test_create_unknown_template_rejected(session, monkeypatch):
+    """create 指定未知模板键 → ResourceNotExistException，实例不落库。"""
+    await seed_start_templates(session)
+    await _ready_node(session)
+    await session.commit()  # 固化节点前置
+
+    with pytest.raises(ResourceNotExistException) as excinfo:
+        await _create_ready_instance(
+            session, monkeypatch, template_key="no-such-template"
+        )
+    assert excinfo.value.details["resource_type"] == "vllm_start_template"
+
+    await session.rollback()
+    found = await VllmInstanceService(session).get_by_field("model_name", "qwen2.5")
+    assert found is None
 
 
 async def test_create_with_task_embedding(session, monkeypatch):

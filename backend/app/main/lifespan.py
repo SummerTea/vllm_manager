@@ -35,6 +35,13 @@ async def lifespan(app: FastAPI):
     if "db" not in app_config.DISABLED_EXTENSIONS:
         await init_db(create_tables=(app_config.DEPLOY_ENV == "DEVELOPMENT"))
 
+        # 2.1 预制 vLLM 启动模板（表空才插，幂等）
+        from app.server.instance.service.start_template import (
+            seed_start_templates,
+        )
+
+        await seed_start_templates()
+
     # 3. 初始化 Redis
     if "redis" not in app_config.DISABLED_EXTENSIONS:
         await init_redis()

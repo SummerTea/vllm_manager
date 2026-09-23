@@ -22,6 +22,7 @@ from app.server.instance.base import estimate_vram_claim
 from app.server.instance.enum import InstanceStateEnum, InstanceTargetStateEnum
 from app.server.instance.model import VllmInstance
 from app.server.instance.schema import VllmInstanceCreateRequest
+from app.server.instance.service.start_template import VllmStartTemplateService
 from app.server.node.enum import NodeStateEnum
 from app.server.node.model import Node
 from app.utils.request_to_worker import request_to_worker
@@ -48,6 +49,7 @@ def _build_start_payload(inst: VllmInstance) -> dict:
         },
         "gpu_indexes": inst.gpu_indexes,
         "vram_claim": inst.vram_claim,
+        "template": inst.template,
     }
 
 
@@ -55,6 +57,12 @@ async def create_vllm_instance(
     session: AsyncSession, data: VllmInstanceCreateRequest
 ) -> VllmInstance:
     """创建 vLLM 实例的请求内编排（不提交事务，由路由层统一提交）。"""
+    # 0. 解析启动模板（无效 template_key 在候选节点/权重广播/allocator 前失败，
+    #    零外部副作用；成功则固化快照供建记录使用）
+    template = await VllmStartTemplateService(session).resolve_template(
+        data.template_key
+    )
+
     # 1. 候选节点：is_active 且重派生状态为 ready
     node_crud = NodeReadOnlyCrud(session)
     candidates: list[Node] = []
@@ -161,7 +169,7 @@ async def create_vllm_instance(
             "显存分配失败", operation="create", reason=result.reason
         )
 
-    # 7. 建记录并 flush（生成 id 供转发指令使用）
+    # 7. 建记录并 flush（template 快照固化；生成 id 供转发指令使用）
     inst = VllmInstance(
         node_id=result.node_id,
         state=InstanceStateEnum.PENDING.value,
@@ -175,6 +183,7 @@ async def create_vllm_instance(
         task=data.task.value,
         model_weight_bytes=model_weight_bytes,
         args=data.args or [],
+        template=template,
         restart_count=0,
     )
     session.add(inst)
