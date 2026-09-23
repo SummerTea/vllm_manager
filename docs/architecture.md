@@ -55,7 +55,7 @@ allocator（分配决策：纯函数，零 DB IO）
 | 显存启动前校验 | pynvml 空闲显存 ≥ 需求，不满足拒启（防超卖双保险） | `_start_model_instance` 前置 |
 | 权重统计 | 本地扫描 `.safetensors/.bin/.pt/.pth` 求和 | `get_local_model_weight_size` |
 | 端口分配 | 探测空闲端口 + 内存集合幂等 | `_assign_ports` |
-| 参数组装 | 用户参数优先，缺省补 `--port/--served-model-name/GMU/--tensor-parallel-size` + env 注入（OMP/SAFETENSORS/VLLM_CACHE_ROOT） | `vllm.py` |
+| 参数组装 | 用户参数优先，缺省补 `--port/--served-model-name/GMU/--tensor-parallel-size` + env 注入（OMP/SAFETENSORS/VLLM_CACHE_ROOT）；**docker run 模板**（server 模板表下发快照 + worker 渲染：`--network host`/`--shm-size`/`--gpus device=` 透传/挂载同路径/env `-e`） | `vllm.py` |
 | 鉴权 | 除注册外全部端点 Bearer token | `api/auth.py` |
 | 不连 PG | 不初始化任何扩展（无 DB/Redis 依赖，无需 `DISABLED_EXTENSIONS`），状态全内存 | — |
 
@@ -66,7 +66,7 @@ allocator（分配决策：纯函数，零 DB IO）
 | worker→server | `POST /nodes/register`、`/nodes/{id}/heartbeat`、`/nodes/{id}/status` | ✅ 已定 |
 | worker→server | `POST /instances/report` | 实例状态对账（独立端点；gpustack 实证：实例状态独立于 worker-status 载荷） |
 | server→worker | `GET /healthz` | 节点健康探测（已落地，Bearer 豁免） |
-| server→worker | `POST /instances/{id}\|stop` | start 携带 `{instance_type, spec:{model_name, task, gmu, tensor_parallel_size, args}, gpu_indexes, vram_claim}`；stop 仅 `{instance_type}`。task 为产品层分类，worker 端按映射表组装 `--task`（vLLM 实际枚举）：`auto/llm → 不注入`（vLLM 自动推断，缺省 generate）、`embedding → --task embed`（勿用弃用别名 embedding）、`rerank → --task score`（cross-encoder；vLLM 版本演进如 0.21+ 移除 score 时按实际枚举映射）；args 已含 `--task` 时不重复注入 |
+| server→worker | `POST /instances/{id}\|stop` | start 携带 `{instance_type, spec:{model_name, task, gmu, tensor_parallel_size, args}, gpu_indexes, vram_claim, template}`；stop 仅 `{instance_type}`。`template` 为 docker 启动模板快照（create 时固化，worker 渲染后 docker run；缺省 worker 内置默认模板兜底）。task 为产品层分类，worker 端按映射表组装 `--task`（vLLM 实际枚举）：`auto/llm → 不注入`（vLLM 自动推断，缺省 generate）、`embedding → --task embed`（勿用弃用别名 embedding）、`rerank → --task score`（cross-encoder；vLLM 版本演进如 0.21+ 移除 score 时按实际枚举映射）；args 已含 `--task` 时不重复注入 |
 | server→worker | `POST /models/weight` | 权重广播查询（并发取首个成功；响应 `{"weight_bytes": int}`） |
 
 **实例状态机**（借鉴 Tier1 #11，显式停止增强）：
@@ -87,6 +87,11 @@ allocator（分配决策：纯函数，零 DB IO）
 ## 六、不做清单（明确排除）
 
 K8s/网关、多租户、模型文件下载管理、多机分布式、调度队列/评分链、多后端、容器 WorkloadPlan、事件总线/控制器订阅、计量计费、压测、推理代理/流量回执、GGUF 估算链、UMA 统一内存、异构 GPU 分组（仅保留同节点同型号 TP 校验一条）。
+
+> 「容器 WorkloadPlan」的边界：排除 gpustack-runtime 容器编排全栈（WorkloadPlan/
+> create_workload/registry/k8s/守护进程）；落地为 **server 模板表
+> （vllm_manager_vllm_start_template）+ worker 模板渲染 docker run**（`--network host`/
+> `--shm-size`/`--gpus` 透传，简单直跑，无编排层）。
 
 ## 七、开发顺序
 

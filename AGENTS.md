@@ -17,7 +17,7 @@ vLLM 推理服务集群管理平台。**server 端（节点/实例/allocator）+
 | 入口 | 位置 | 端口 | 说明 |
 |------|------|------|------|
 | backend server | `backend/app/main:app` | 8000 | Web + REST 管理端（lifespan：init_logging→db→redis→saq） |
-| backend worker | `backend/app/work_worker.py`（`python app/work_worker.py`） | 8100 | 管控节点（GPU 机器，**不连 PG，不初始化任何扩展**——无 DB/Redis 依赖，无需 `DISABLED_EXTENSIONS`；默认 `--host 0.0.0.0`，端口由 `WORKER_LISTEN_PORT` 配置，server 跨机回连硬约束） |
+| backend worker | `backend/app/work_worker.py`（`python app/work_worker.py`） | 8100 | 管控节点（GPU 机器，**不连 PG，不初始化任何扩展**——无 DB/Redis 依赖，无需 `DISABLED_EXTENSIONS`；默认 `--host 0.0.0.0`，端口由 `WORKER_LISTEN_PORT` 配置，server 跨机回连硬约束；**依赖 docker + `WORKER_VLLM_IMAGE`（vllm/vllm-openai）容器启动 vLLM**，启动命令模板化——server 模板表下发快照，worker 渲染 docker run） |
 | backend SAQ worker | `backend/app/work_saq.py` | — | `python app/work_saq.py -q default` |
 | frontend SPA | `frontend/` | 5178(dev) | 管理页面，访问路径 `/vllm_manager/frontend/` |
 
@@ -47,8 +47,8 @@ vllm_manager/
 │   │   │   ├── collector.py           # GPU/系统采集（pynvml 优雅降级）
 │   │   │   ├── main.py                # create_app + lifespan（注册→restore→后台循环）
 │   │   │   ├── exceptions.py          # JSON-only 异常处理器（独立于 server）
-│   │   │   ├── process_utils.py       # 端口/进程树/路径/命令组装/env
-│   │   │   ├── lifecycle.py           # 实例生命周期（start/stop/健康检查/退避重启/restore）
+│   │   │   ├── process_utils.py       # 端口分配/docker 模板渲染（无 shell）/容器生命周期（stop_container/inspect_container）/路径/命令/env 片段
+│   │   │   ├── lifecycle.py           # 实例生命周期（docker 容器 start/stop/健康检查/退避重启/restore）
 │   │   │   └── api.py                 # start/stop/weight 端点（Bearer 鉴权）
 │   │   ├── base/                      # base_config/base_crud(泛型)/base_enum/base_model(UUID7 Id + Timestamp)/响应契约(BaseResponse/ListResponse)
 │   │   ├── extensions/                # database/redis/saq/logging 单例（全部懒加载，import 零连接）
@@ -155,3 +155,14 @@ Read-only dependency source repositories are available under
 
 - `.slim/clonedeps/repos/gpustack__gpustack/` — gpustack/gpustack at v2.2.3; GPU 集群管理参考实现，worker 端 vLLM 实例启停（serve_manager.py、backends/vllm.py）、GPU 监控与指标采集对标本项目的 worker 端。
   - 仓库导航：先读该仓库根 `codemap.md`（Repository Atlas，含目录职责总表与阅读顺序），深入某目录前读对应 `codemap.md`（如 `gpustack/worker/codemap.md`）。
+
+## Repository Map
+
+A full codemap is available at `codemap.md` in the project root.
+
+Before working on any task, read `codemap.md` to understand:
+- Project architecture and entry points (server :8000 / worker :8100 / frontend)
+- Directory responsibilities and design patterns (node←instance←allocator 单向依赖、worker 对账闭环)
+- Data flow and integration points between modules (request_to_worker 转发、/instances/report 对账)
+
+For deep work on a specific folder, also read that folder's `codemap.md`.

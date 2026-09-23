@@ -23,10 +23,10 @@
 | 1 | **显存分配在调度层，不在命令注入层** | vllm 后端不注入 GMU（vllm.py 无此代码）；`vram_claim` 由 server 算（schemas/models.py:423），worker 只消费 | worker 启动前用 pynvml 校验：目标 GPU 空闲显存 ≥ 实例声明需求，不满足拒绝启动（防多实例超卖双保险） |
 | 2 | **实例需求估算** | `estimate_model_vram()`（policies/utils.py:384）：`claim = weight × 1.2 + 2GiB(LLM)`；权重来源：本地目录扫描 `.safetensors/.bin/.pt/.pth` 求和 | server 创建实例时让 **worker 本地统计权重大小**（免 HF API 依赖）；`vram_claim = weight×1.2 + 2GiB` |
 | 3 | **选卡判定（first-fit）** | `vllm_resource_fit_selector.py:401`：逐卡判 `① available/total ≥ GMU ② vram_claim ≤ total×GMU`；多卡 TP 时按 allocatable 率降序累加 + `num_attention_heads % tp == 0` 整除校验 | 单卡/多卡 TP 直接照抄三条件；多卡时 worker 本地读 `config.json` 校验 TP 整除 |
-| 4 | **决策结果 → 启动参数注入** | 调度结果回写 `gpu_indexes`；worker `_get_selected_gpu_devices()` 按卡过滤，`get_auto_parallelism_arguments()` 自动补 `--tensor-parallel-size N`（vllm.py:1028） | 决策结果 `{node_id, gpu_indexes, gmu}` 随启停指令下发；worker 注入 `CUDA_VISIBLE_DEVICES="0,1"` + 多卡补 `--tensor-parallel-size`，GMU 用户参数透传 |
+| 4 | **决策结果 → 启动参数注入** | 调度结果回写 `gpu_indexes`；worker `_get_selected_gpu_devices()` 按卡过滤，`get_auto_parallelism_arguments()` 自动补 `--tensor-parallel-size N`（vllm.py:1028） | 决策结果 `{node_id, gpu_indexes, gmu}` 随启停指令下发；worker 渲染 `--gpus device={gpu_indexes}` 透传（容器内 CUDA 索引=宿主索引，**无 CUDA_VISIBLE_DEVICES**）+ 多卡补 `--tensor-parallel-size`，GMU 用户参数透传 |
 | 5 | **健康检查 = HTTP 而非进程存活** | `is_ready()`（serve_manager.py:1741）：`GET /v1/models` 1s 超时 200 即 running | `running` 判定 = 进程存活 && `/v1/models` 200（1s 超时）；同时是启动超时/失败判定的标准答案 |
 | 6 | **启动失败显式落 ERROR + state_message** | `_start_model_instance()` except 分支（serve_manager.py:1392）写 ERROR + 可读原因 | worker 启动 try/except，失败信息写入 `state_message` 随心跳上报，server 直接展示 |
-| 7 | **psutil 递归树终止兜底 killpg** | `terminate_process_tree()`（utils/process.py:70）：psutil 递归 children → SIGTERM → 3s → SIGKILL | 保留现有 killpg（3s 节奏），补充 psutil 递归树兜底（vllm 多进程可能脱离进程组） |
+| 7 | **psutil 递归树终止兜底 killpg** | `terminate_process_tree()`（utils/process.py:70）：psutil 递归 children → SIGTERM → 3s → SIGKILL | 保留为宿主机进程工具参考（S9 已从 worker 移除）；**docker 场景用 `docker stop -t 3 → kill → rm`**（killpg 杀 CLI 不杀容器致孤儿） |
 | 8 | **注册幂等下发 token + 配置** | `POST /v2/workers`（routes/workers.py:613）：一次返回 `token + worker_config`；按 uuid/name 重注册**复用旧 token 不轮换**（幂等） | server node 表加 `token` 列（`secrets.token_hex(24)`）；注册按 hostname 幂等，重注册返回原 token |
 | 9 | **心跳与状态上报分离** | `/worker-heartbeat`（空 body 只记 ID）vs `/worker-status`（全量载荷）；5s 缓冲批量落库（worker_status_buffer.py） | 保留两端点分离；server 低并发直接落库，可选照抄 20 行批量 UPDATE |
 | 10 | **离线判定收敛为 compute_state()** | `Worker.compute_state()`（schemas/workers.py:379）：心跳超时→NOT_READY + 可读文案；主动探测失败→UNREACHABLE | Node 模型加 `compute_state()`（30s 心跳超时→offline + state_message）；保留 `/healthz` 主动探测（15 行）区分「worker 死 vs 断网」 |
@@ -34,7 +34,7 @@
 | 12 | **实例对账 = 心跳实例列表** | worker 直接 PUT 实例状态，server 不猜 | 心跳载荷内嵌实例列表，server 与 DB 逐实例对账（新增/消失/迁移），达成目标态后清 target_state |
 | 13 | **env 优化注入** | `_get_configured_env()`（vllm.py:356）：`OMP_NUM_THREADS=1`、`SAFETENSORS_FAST_GPU=1`、`VLLM_CACHE_ROOT` 持久目录 | 直接采纳前两个；VLLM_CACHE_ROOT 指向 worker 持久目录（可选） |
 | 14 | **日志按 restart_count 编号轮转** | `{log_dir}/serve/{id}.{restart_count}.log`（serve_manager.py:890） | `logs/{instance_id}.{n}.log` 轮转，崩溃可回看上一轮 |
-| 15 | **周期对账 + 指数退避重启** | `sync_model_instances_state()` 周期权威判定；`_restart_error_model_instance()`：`delay = min(10·2ⁿ, 300s)` | worker `sync_loop()`（3-5s）：starting 超时→error；error 且允许重启→退避置回 pending；单次异常不终止线程 |
+| 15 | **周期对账 + 指数退避重启** | `sync_model_instances_state()` 周期权威判定；`_restart_error_model_instance()`：`delay = min(10·2ⁿ, 300s)` | worker `sync_loop()`（3-5s）：starting 超时→error；error 且允许重启→退避置回 starting（本项目口径，见 worker-contract §3）；单次异常不终止线程 |
 | 16 | **端口分配全局锁 + 幂等** | `_assign_ports()`（serve_manager.py:1414）：`_port_lock` + `_assigned_ports` 集合，已分配直接返回 | worker 启动前 socket 探测端口 + 内存集合记录已分配端口（对应"端口冲突拒绝"约定） |
 | 17 | **参数注入用户优先** | `extend_args_no_exist()`（utils/command.py:137）：用户已传同名参数则不注入 | worker 组装命令时先扫用户参数，缺什么补什么（尤其 `--port`/`--served-model-name`/GMU） |
 | 18 | **worker 端点统一 Bearer 鉴权** | `worker_auth`（api/auth.py:401）：worker 端点只认 worker token；server→worker 统一走 `request_to_worker`（worker_request.py:153，统一注入 token + 15s 超时） | server 一个 `request_to_worker(node, method, path)` 工具函数统一注入 Bearer；worker 除注册外所有端点挂 token 鉴权依赖 |
@@ -60,7 +60,7 @@
 | 多节点分布式 | Ray/MP 跨机、`subordinate_workers`、`distributed_servers`、多机拓扑——单实例单机 |
 | 调度队列/重调度/评分链 | `AsyncUniqueQueue`、ANALYZING 门控、BINPACK/SPREAD 评分、ModelFileLocality——first-fit 足够 |
 | 多后端 | SGLang/MindIE/VoxBox/Custom 分派——backend 固定 vLLM |
-| 容器 WorkloadPlan | gpustack-runtime create_workload 等——直接 subprocess |
+| 容器 WorkloadPlan | gpustack-runtime create_workload 等——直接 docker run 即可 | **排除 gpustack-runtime 容器编排全栈**（WorkloadPlan/create_workload/registry/k8s/gpustack-runtime 守护）；落地为 **server 模板表（vllm_manager_vllm_start_template）+ worker 模板渲染 docker run**（`--network host`/`--shm-size`/`--gpus` 透传，与 gpustack host_network=True + shm 10GiB + resources[gpus] 实证对齐） |
 | 模型文件下载管理 | ModelFileManager、HF/GGUF 解析——vllm serve 自管模型加载 |
 | 多租户 | TenantContext/principals/api_keys 全套——单管理端单租户 |
 | 多实例 HA | leader 选举、coordinator、LocalCoordinator——单管理端进程 |
@@ -76,7 +76,7 @@
 - 版本化 run_command 模板（固定 `vllm serve`）
 - 分布式 env 注入（NCCL/GLOO/HCCL/RAY_LOG 系列）
 - worker 推理代理与流量回执（server 直连转发，无代理层）
-- `multiprocessing.Process + RedirectStdoutStderr` 包装（Popen + start_new_session 更贴合）
+- `multiprocessing.Process + RedirectStdoutStderr` 包装（Phase B 容器化后：**docker run 前台 + stdout 重定向日志文件**；停止用 `docker stop -t 3 → kill → rm` 替代 killpg——killpg 只杀 CLI 不杀容器致孤儿）
 - UMA 统一内存 / extended KV cache RAM claim（NVIDIA 独立显存）
 - 异构 GPU 分组聚类（最多保留"同节点同型号才允许 TP 混卡"一条校验）
 - 事件记录器/调度消息聚合（只需一条拒绝原因字符串）
@@ -89,11 +89,11 @@
 
 - **状态集合**：`pending → starting → running → error`（+ `stopping`）；内存维护 `target_state`（server 下发）与 `actual_state`（实测）
 - **关键函数**：
-  - `start_instance`：显存校验（pynvml 空闲 ≥ 需求，否则拒绝）→ 端口探测 → 组装命令（用户参数优先补 `--port/--served-model-name/GMU`，env 注入）→ `Popen(start_new_session=True)` → 写 pid 文件 → `starting`
-  - `check_health`：进程存活 && `GET /v1/models`（1s 超时）→ `running`，否则计数
-  - `stop_instance`：killpg SIGTERM → 3s → SIGKILL + psutil 递归树兜底；清状态
-  - `restore_instances`：重启时读 pid 文件 + psutil 存活恢复
-  - `sync_loop`（3-5s）：starting 超时→error；error 可重启→指数退避（10·2ⁿ ≤ 300s）置回 pending；running 失联→error；失败写 `state_message`
+  - `start_instance`：显存校验（pynvml 空闲 ≥ 需求，否则拒绝）→ 端口探测 → 组装命令（用户参数优先补 `--port/--served-model-name/GMU`，env 注入）→ **`render_docker_command` 模板渲染（`--network host`/`--shm-size 10g`/`--gpus device=`/env `-e`/挂载同路径）→ Popen docker run 前台 + 日志重定向** → 写 meta（docker inspect 可恢复）→ `starting`
+  - `check_health`：docker CLI 存活 && `GET /v1/models`（1s 超时，host 网络直连）→ `running`，否则计数；CLI 已退出 → 直接 error
+  - `stop_instance`：`docker stop -t 3` → 超时 `docker kill` → `docker rm`；清状态
+  - `restore_instances`：重启时读 meta + `docker inspect`（State.Status==running 才恢复，仅恢复 running）
+  - `sync_loop`（3-5s）：starting 超时→error；error 可重启→指数退避（10·2ⁿ ≤ 300s）置回 starting；running 失联→error；失败写 `state_message`
 
 ### server 端（allocator.py，约 150-250 行）
 
