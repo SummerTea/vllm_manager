@@ -172,6 +172,32 @@ async def test_report_loop_exception_does_not_exit(caplog):
     assert len(client.reported) >= 1  # 循环未退出，后续轮次正常上报
 
 
+async def test_report_loop_empty_snapshot_still_reports(caplog):
+    """问题 E 防回归：快照为空也必须上报（空 items）——server 依赖「上报消失」
+    分支收敛 target=stopping 实例；若空快照跳过则单实例 stop 后消失信号丢失，
+    server 永远挂起（冒烟实测：手动空 report 立即收敛，跳过则不收敛）。"""
+    reported: list[list[dict]] = []
+
+    class _FakeLifecycle:
+        async def snapshot_for_report(self):
+            return []  # 空快照（如单实例 stop 后）
+
+    class _FakeClient:
+        async def report_instances(self, node_id, token, items):
+            reported.append(items)
+
+    task = asyncio.create_task(
+        report_loop(_FakeClient(), _FakeLifecycle(), "n-1", "t", 0)
+    )
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert len(reported) >= 1  # 空快照也上报（items==[]），未跳过
+    assert reported[-1] == []
+
+
 async def test_sync_loop_exception_does_not_exit(caplog):
     """三循环-3：sync_loop 首轮异常被捕获并 continue，后续轮次继续 sync。"""
     calls = {"n": 0}

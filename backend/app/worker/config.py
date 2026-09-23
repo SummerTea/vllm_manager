@@ -34,7 +34,12 @@ class WorkerConfig(AppBaseConfig):
         default=BASE_PATH / "data" / "models", description="模型根目录"
     )
     WORKER_VLLM_BIN: str = Field(
-        default="vllm", description="vLLM 可执行命令（PATH 或绝对路径，容器内命令）"
+        default="vllm",
+        description=(
+            "历史保留字段（A1 整改）：不再参与默认模板渲染——官方镜像 "
+            'ENTRYPOINT=["vllm","serve"] 承担 vllm serve；build_vllm_command '
+            "仍读取该值，自定义镜像场景本期不支持"
+        ),
     )
     WORKER_VLLM_IMAGE: str = Field(
         default="vllm/vllm-openai:latest", description="vLLM 容器镜像"

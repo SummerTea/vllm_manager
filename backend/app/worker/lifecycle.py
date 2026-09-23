@@ -198,9 +198,9 @@ class InstanceLifecycleManager:
         """渲染 docker run 命令、Popen 启动、写 meta（start 与退避重启复用）。
 
         - template = spec["template"]（start 快照）或内置 DEFAULT_VLLM_RUN_TEMPLATE 兜底
-        - build_vllm_command 产出 [vllm_bin, serve, model_path, ...args]，模板已含
-          {vllm_bin} serve {model_path}，仅取 args 部分（第 3 元素后）经 shlex.join
-          作为 {args} 片段
+        - build_vllm_command 产出 [vllm_bin, serve, model_path, ...args]；args 片段
+          从 model_path 之后定位（模板依赖镜像 ENTRYPOINT 承担 vllm serve，不再拼
+          {vllm_bin} serve）经 shlex.join 作为 {args} 片段
         - env 经 -e 传入（不再 Popen env）；GPU 经 --gpus 透传（不再 CUDA_VISIBLE_DEVICES）
         - 渲染后 argv 交 Popen（**无 shell**）；记录 docker CLI pid 供探活/日志
 
@@ -236,7 +236,9 @@ class InstanceLifecycleManager:
         if self._instances.get(record.instance_id) is not record:
             return
 
-        # args 片段：仅取 build_vllm_command 的 args 部分（模板已含 vllm_bin/serve/model_path）
+        # args 片段：仅取 build_vllm_command 的 args 部分——模板依赖镜像 ENTRYPOINT
+        # 承担 vllm serve，故从 model_path 之后定位 args（多词 vllm_bin 下 model_path
+        # 不会漏进 args 片段）
         full_cmd = build_vllm_command(
             self._config.WORKER_VLLM_BIN,
             model_path,
@@ -244,7 +246,9 @@ class InstanceLifecycleManager:
             record.port,
             self._config.INSTANCE_DEFAULT_GMU,
         )
-        args_fragment = join_arg_fragment(full_cmd[3:])
+        args_fragment = join_arg_fragment(
+            full_cmd[full_cmd.index(str(model_path)) + 1 :]
+        )
 
         # env -e 片段：OMP_NUM_THREADS/SAFETENSORS_FAST_GPU 仅 GPU 实例注入
         # （CPU-only 场景注入 OMP_NUM_THREADS=1 会把推理锁单线程，性能极差；
@@ -458,11 +462,15 @@ class InstanceLifecycleManager:
                 if code is not None:
                     record.state = WorkerInstanceStateEnum.ERROR
                     record.state_message = f"docker run 进程已退出（code={code}）"
-                    # S5：docker 侧永久错误（125 daemon 错误/126 不可执行/127 命令不存在）
-                    # → retryable=False 不再自动重启（镜像缺失/容器内命令不存在重试无意义）；
-                    # 其余退出码（容器内业务错误，如模型加载失败）保持 retryable=True 可退避恢复
-                    if code in (125, 126, 127):
+                    # S5：永久性错误三层语义——2=CLI 参数契约错误（vLLM argparse
+                    # 恒 exit 2，模板/镜像契约 bug 重试无意义）/125=docker daemon
+                    # 错误（镜像缺失等）/126 不可执行、127 命令不存在 →
+                    # retryable=False 不再自动重启；其余退出码（容器内业务错误，
+                    # 如模型加载失败）保持 retryable=True 可退避恢复
+                    if code in (2, 125, 126, 127):
                         record.retryable = False
+                        if code == 2:
+                            record.state_message += "（CLI 参数契约错误）"
                 elif await self._health_ok(record):
                     record.state = WorkerInstanceStateEnum.RUNNING
                     record.state_message = None

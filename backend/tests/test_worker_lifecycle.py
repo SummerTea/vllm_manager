@@ -83,7 +83,8 @@ async def test_start_success_creates_starting_record(manager, monkeypatch):
     """start 受理成功：record STARTING、cmd 为 docker run argv（默认模板渲染）。
 
     断言：--name/--network host/--shm-size 10g/--gpus device=/挂载/env/镜像、
-    vllm serve model_path、--port/--served-model-name/GMU 补全。
+    model_path（镜像 ENTRYPOINT 承担 vllm serve，模板不再含 serve）、
+    --port/--served-model-name/GMU 补全。
     """
     captured: dict = {}
 
@@ -114,8 +115,11 @@ async def test_start_success_creates_starting_record(manager, monkeypatch):
     assert cmd[cmd.index("--shm-size") + 1] == "10g"
     assert cmd[cmd.index("--gpus") + 1] == "device=0"
     assert "vllm/vllm-openai:latest" in cmd
-    assert "vllm" in cmd and "serve" in cmd
-    assert str(manager._config.WORKER_MODEL_ROOT / "qwen2.5") in cmd
+    assert "serve" not in cmd  # A1：镜像 ENTRYPOINT 承担 vllm serve，模板不再拼 serve
+    model_path = str(manager._config.WORKER_MODEL_ROOT / "qwen2.5")
+    assert model_path in cmd
+    # model_path 之后是 args 片段首 token（--port 补全），不再漏 vllm_bin/serve
+    assert cmd[cmd.index(model_path) + 1] == "--port"
     # vLLM 参数（模板 {args} 片段还原）
     assert "18080" in cmd  # --port 补全
     assert "--served-model-name" in cmd
@@ -758,6 +762,23 @@ async def test_sync_starting_cli_exit_code_125_retryable_false(manager, monkeypa
     )
     await manager.sync()
     assert manager._instances["i-1"].retryable is False  # 不再无限退避重启
+
+
+async def test_sync_starting_cli_exit_code_2_retryable_false(manager, monkeypatch):
+    """A1/B：CLI 快速失败 code=2（vLLM CLI 参数契约错误——模板/镜像契约 bug 恒
+    exit 2，如 `vllm serve vllm serve <path>` 叠加）→ retryable=False 不再自动重启
+    + state_message 追加「CLI 参数契约错误」提示。"""
+    proc = _FakePopenSimple()
+    proc._code = 2
+    rec = _record(process=proc, pid=999, retryable=True)
+    manager._instances["i-1"] = rec
+    monkeypatch.setattr(
+        "app.worker.lifecycle.InstanceLifecycleManager._health_ok",
+        _health_true,  # 不应触达（先判 CLI 退出）
+    )
+    await manager.sync()
+    assert manager._instances["i-1"].retryable is False  # 不再无限退避重启
+    assert "CLI 参数契约错误" in (manager._instances["i-1"].state_message or "")
 
 
 async def test_sync_starting_cli_exit_business_code_keeps_retryable(manager, monkeypatch):

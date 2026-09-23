@@ -795,6 +795,34 @@ async def test_stop_stopped_instance_rejected(session, monkeypatch):
         await VllmInstanceService(session).stop(inst.id)
 
 
+async def test_stop_error_instance_allowed(session, monkeypatch):
+    """C1：error 实例可停止（stop 守卫含 ERROR）→ target=stopping + 转发 stop。"""
+    await _ready_node(session)
+    inst = await _create_ready_instance(session, monkeypatch)
+    inst.state = InstanceStateEnum.ERROR.value
+    inst.target_state = InstanceTargetStateEnum.NONE.value
+    await session.flush()
+
+    calls = []
+
+    async def fake_request_to_worker(node, method, path, **kwargs):
+        calls.append((method, path, kwargs))
+        return FakeResponse()
+
+    monkeypatch.setattr(
+        "app.server.instance.service.instance.request_to_worker",
+        fake_request_to_worker,
+    )
+
+    out = await VllmInstanceService(session).stop(inst.id)
+
+    assert out.target_state == InstanceTargetStateEnum.STOPPING.value
+    method, path, kwargs = calls[-1]
+    assert method == "post"
+    assert path == f"instances/{inst.id}/stop"
+    assert kwargs["json"] == {"instance_type": "vllm"}
+
+
 async def test_start_stop_reset_target_retry_count(session, monkeypatch):
     """1B-1：start()/stop() 写 target_state 时重置 target_retry_count（用户操作重置预算）。"""
     node = await _ready_node(session)
@@ -834,6 +862,32 @@ async def test_delete_active_instance_stops_then_deletes(session, monkeypatch):
     await _ready_node(session)
     inst = await _create_ready_instance(session, monkeypatch)
     inst.state = InstanceStateEnum.RUNNING.value
+    await session.flush()
+
+    calls = []
+
+    async def fake_request_to_worker(node, method, path, **kwargs):
+        calls.append(path)
+        return FakeResponse()
+
+    monkeypatch.setattr(
+        "app.server.instance.service.instance.request_to_worker",
+        fake_request_to_worker,
+    )
+
+    await VllmInstanceService(session).delete(inst.id)
+
+    assert calls == [f"instances/{inst.id}/stop"]
+    got = await VllmInstanceService(session).get_by_id(inst.id)
+    assert got is None
+
+
+async def test_delete_error_instance_stops_then_deletes(session, monkeypatch):
+    """C1（可选变体）：error 实例 delete → 先转发 stop 成功再物理删除
+    （delete 语义不改，非 stopped 一律先 stop）。"""
+    await _ready_node(session)
+    inst = await _create_ready_instance(session, monkeypatch)
+    inst.state = InstanceStateEnum.ERROR.value
     await session.flush()
 
     calls = []

@@ -138,6 +138,7 @@ docker rm -f vllm-cpu-test
 | 1 | server allocator 拒绝无 GPU 节点（`gpu_devices` 为空 → `AllocationRejected("节点 X 无可用 GPU")`） | 显式 `WORKER_ACCELERATOR=cpu` 声明 → allocator 走 CPU 分支：`gpu_indexes=[]`、`allocated_vram={}`、tp>1 拒绝；**fail-closed：GPU/未声明/`gpu_devices` 空仍拒绝**（不按空列表推断 CPU，防 GPU 采集降级 fail-open 误分配） | `allocator/service.py:_try_worker`、`allocator/schema.py:WorkerResource`、`service/creation.py` |
 | 2 | docker 模板硬编码 `--gpus device=`（colima 无 NVIDIA 驱动报错） | 模板新增结构性片段 `{net_args}`/`{gpus_args}`：CPU → `-p {port}:{port}` + 空串（无 `--gpus`）；GPU 行为不变；server/worker 双份常量同步 + 防漂移测试锁定 | `process_utils.py:DEFAULT_VLLM_RUN_TEMPLATE`/`build_context`、`creation.py:DEFAULT_VLLM_RUN_TEMPLATE` |
 | 3 | `--network host` + `127.0.0.1` 健康检查在 colima 下不通 | CPU 改用 `-p {port}:{port}` 端口映射（colima 下宿主机 `127.0.0.1:{port}` 可达），健康检查不变（`GET /v1/models` 1s 200） | `lifecycle.py:_launch_container`/`_health_ok` |
+| 4 | 默认模板含 `{vllm_bin} serve` 与镜像 ENTRYPOINT 叠加 → docker 实执行 `vllm serve vllm serve <path>` → exit 2（GPU/CPU 主战场同 bug） | 默认模板去 `{vllm_bin} serve`，**依赖镜像 `ENTRYPOINT=["vllm","serve"]`**（A1 整改）：`docker run ... {image} {model_path} {args}`；`{vllm_bin}` 键仅存量模板兼容保留 | `process_utils.py:DEFAULT_VLLM_RUN_TEMPLATE`、`creation.py:DEFAULT_VLLM_RUN_TEMPLATE` |
 
 **已实施的 CPU 集成测试改造**：
 
@@ -200,11 +201,31 @@ worker 侧已有两处正确降级（无需改）：`_check_vram`（pynvml 不�
 
 3. **create 请求示例**（`POST /vllm_manager/api/v1/instances`）：
 
-   ```json
-   {
-     "model_name": "Qwen3-0.6B",
-     "args": ["--enforce-eager", "--dtype", "float32", "--max-model-len", "4096"]
-   }
-   ```
+    ```json
+    {
+      "model_name": "Qwen3-0.6B",
+      "args": [
+        "--enforce-eager", "--dtype", "float32", "--max-model-len", "4096",
+        "--gpu-memory-utilization", "0.5"
+      ]
+    }
+    ```
 
    （§4 关键参数经 `args` 透传；`tensor_parallel_size` 保持 1——CPU 分支 tp>1 拒绝。）
+
+> **CPU 内存预算（P1-2）**：CPU 后端把 `--gpu-memory-utilization`（GMU）解释为
+> **CPU 内存保留比例**（非显存）——默认 0.9 × 本机 7.74GiB ≈ 6.96GiB > 启动时可用
+> ~5.74GiB，vLLM 会在 KV cache 分配前拒绝启动。**CPU 场景必须经 args 显式调低**
+> （本机实测 0.5 可推进到 KV cache 分配阶段）。GPU 场景不受影响（GMU 仍按显存语义）。
+>
+> **运行内存硬约束（冒烟实测）**：colima VM 总内存 **7.74GiB 不足以跑通
+> Qwen3-0.6B/float32 全链路**——权重加载后可用仅 ~2.19GiB，GMU 0.5 的 KV 预算
+> 3.87GiB 确定性超预算。**需 colima 扩容 ≥16GiB**（`colima stop && colima start
+> --memory 16`）或换更小模型/`--dtype bfloat16` 不可行（arm64 oneDNN 缺陷，见 §4 坑 5）
+> ——或继续降 GMU（余量极小，不建议）。
+
+> **A1 注记（模板依赖镜像 ENTRYPOINT）**：默认模板不再含 `{vllm_bin} serve`——
+> `vllm serve` 由官方镜像 `ENTRYPOINT=["vllm","serve"]` 承担（旧模板叠加会实执行
+> `vllm serve vllm serve <path>` → exit 2）。**存量实例若 template 快照是旧格式
+> （含 `{vllm_bin} serve`），需 delete + create 重建**才会下发新模板；worker 侧
+> `{vllm_bin}` 键仍兼容旧格式模板渲染（不 KeyError）。

@@ -254,7 +254,7 @@ worker ──/instances/report 上报实际 state/port/restart_count──▶ se
 |---|---|---|
 | `{name}` | 容器名 | `vllm-{instance_id}` |
 | `{image}` | 容器镜像 | `WORKER_VLLM_IMAGE` |
-| `{vllm_bin}` | 容器内命令 | 如 `python -m vllm.entrypoints.openai.api_server`（按 worker 实现） |
+| `{vllm_bin}` | 容器内命令 | **存量模板兼容保留，默认模板不再使用**——`vllm serve` 由镜像 ENTRYPOINT 承担（官方 vllm-openai GPU/CPU 镜像 `ENTRYPOINT=["vllm","serve"]`）；仅旧格式模板渲染该键（`build_context` 仍填充，不 KeyError） |
 | `{model_path}` | 模型路径 | `resolve_model_path` 解析后的路径 |
 | `{port}` | 服务端口 | worker 分配的端口 |
 | `{gpu_indexes}` | GPU 索引 | 逗号分隔字符串；**存量模板兼容保留**（默认模板经 `{gpus_args}` 使用，不再直接拼 `--gpus device=`） |
@@ -454,6 +454,7 @@ Phase B 容器化后走 docker run 模板渲染）：
 | `INSTANCE_REQUEST_TIMEOUT` | 15s | server→worker 指令转发超时 | 否（server 侧转发） |
 | `INSTANCE_WEIGHT_TIMEOUT` | 15s | 权重广播查询超时 | 否（server 侧转发） |
 | `INSTANCE_DEFAULT_GMU` | 0.9 | 实例默认显存利用率 GMU（0-1） | **是（缺省补 GMU 参数）** |
+| `WORKER_VLLM_BIN` | `vllm` | **历史保留字段**：不再参与默认模板渲染（A1 整改——官方镜像 `ENTRYPOINT=["vllm","serve"]` 承担 `vllm serve`）；`build_vllm_command` 仍读取该值，自定义镜像场景本期不支持 | **是（build_vllm_command）** |
 | `WORKER_VLLM_IMAGE` | `vllm/vllm-openai:latest` | vLLM 容器镜像（渲染 `{image}`） | **是（docker run 镜像）** |
 | `WORKER_VLLM_SHM_SIZE_GIB` | 10.0 | 共享内存 GiB（渲染 `--shm-size {shm_size}`，vLLM 大模型加载需要） | **是（渲染 {shm_size}）** |
 | `WORKER_ACCELERATOR` | `gpu` | 加速器类型（`gpu`/`cpu`）；`cpu` 为 CPU 集成测试显式声明，默认 `gpu` 保持 GPU 主战场 fail-closed | **是（status 载荷上报 `accelerator`）** |
@@ -462,9 +463,10 @@ Phase B 容器化后走 docker run 模板渲染）：
 
 worker 实现时需要感知：`WORKER_DEFAULT_PORT`（默认监听端口）、`INSTANCE_DEFAULT_GMU`
 （启动参数组装缺省 GMU）、`WORKER_VLLM_IMAGE`（容器镜像）、`WORKER_VLLM_SHM_SIZE_GIB`
-（共享内存）、`WORKER_VLLM_BIN`（**容器内 vLLM 命令**，支持多词形式如
-`python -m vllm.entrypoints.openai.api_server`——worker 渲染 `{vllm_bin}` 时
-`shlex.split` 展开为多 token）。其余为 server 侧约束/任务，worker 只需遵守端点契约。
+（共享内存）、`WORKER_VLLM_BIN`（**历史保留字段（A1）**：不再参与默认模板渲染——
+官方镜像 ENTRYPOINT 承担 `vllm serve`；`build_vllm_command` 仍读取该值作为
+`[vllm_bin, serve, model_path]` 前缀，自定义镜像场景本期不支持）。其余为 server 侧
+约束/任务，worker 只需遵守端点契约。
 ## 6. 定案回写（worker 实现已落地）+ 真待定项
 
 ### 已定案（worker 实现落地，见 backend/app/worker/）
@@ -476,6 +478,7 @@ worker 实现时需要感知：`WORKER_DEFAULT_PORT`（默认监听端口）、`
 | stopping 过渡期上报 | worker 内存态有 STOPPING 但 `snapshot_for_report` 跳过；stop 完成清内存记录 → report 消失 → server 收敛 stopped | `lifecycle.py:snapshot_for_report` / `stop` |
 | GPU 优雅降级 | pynvml 不可用/无 GPU → 空 `gpu_devices` + 告警一次，绝不抛异常 | `collector.py:_collect_gpu_devices` |
 | docker 启动渲染 | 模板 `format_map` → `shlex.split` → argv 直传 Popen（**无 shell**）；`{args}`/`{env_args}`/`{mount_args}` 片段经 shlex.join 预 quote；用户可控占位值经 shlex.quote 防御；`{net_args}`/`{gpus_args}` 为结构性差异片段（按 `gpu_indexes` 派生，见下） | `process_utils.py:render_docker_command`/`build_context` |
+| ENTRYPOINT 契约（A1） | 官方 vllm-openai 镜像（GPU/CPU）`ENTRYPOINT=["vllm","serve"]`；默认模板去 `{vllm_bin} serve`（`docker run ... {image} {model_path} {args}`，由镜像 ENTRYPOINT 承担），防叠加实执行 `vllm serve vllm serve <path>` → exit 2；`{vllm_bin}` 键仅存量模板兼容保留；worker `_launch_container` args 片段从 model_path 之后定位；CLI 退出码 2（argparse 契约错误）→ retryable=False | `process_utils.py:DEFAULT_VLLM_RUN_TEMPLATE`/`build_context`、`creation.py:DEFAULT_VLLM_RUN_TEMPLATE`、`lifecycle.py:_launch_container`/`sync` |
 | 容器停止 | `docker stop -t 3` → 超时/失败 `docker kill` → `docker rm`；**绝不 killpg docker CLI**（杀 CLI 不杀容器致孤儿）；stop/rm 对不存在容器容错；`stop_container` 返回 `bool`，docker 命令不可用（停止结果未知）→ `stop()` 恢复调用前状态、保留记录/meta、返回 500 不谎报停止（server 对账重下发兜底） | `process_utils.py:stop_container` / `lifecycle.py:stop` |
 | 停止悬挂收敛 | server `apply_report`：`target=stopping` 且上报非 stopped → 限次重下发 stop（`target_retry_count` ≤3，超限 `state_message` 告警、保持 target 不自动收敛）；start/stop 重置计数 | `service/instance.py:apply_report`、`base.py:InstanceLifecycleMixin.target_retry_count` |
 | 转发错误码透传 | server 全局 handler 透传 worker 非 2xx 的 `status_code`（401/403→502 防前端误判）；start/create 转发处先 `except HttpClientException: raise` 再包装传输错误 | `main/exceptions.py:http_client_exception_handler`、`service/instance.py:start`、`service/creation.py` |

@@ -60,12 +60,13 @@ async def report_loop(
     token: str,
     interval: int,
 ) -> None:
-    """周期上报实例快照对账（快照为空则跳过；异常不退出）。"""
+    """周期上报实例快照对账（**空快照也必须上报**——server 依赖「上报消失」分支
+    收敛 target=stopping 实例，快照为空若跳过则单实例 stop 后消失信号丢失，server
+    永远挂起；异常不退出）。"""
     while True:
         try:
             items = await lifecycle.snapshot_for_report()
-            if items:
-                await client.report_instances(node_id, token, items)
+            await client.report_instances(node_id, token, items)
         except asyncio.CancelledError:
             raise
         except Exception:

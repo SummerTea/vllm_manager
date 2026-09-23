@@ -309,7 +309,11 @@ def test_render_old_format_template_no_keyerror(tmp_path):
 
 
 def test_render_docker_command_default_template(tmp_path):
-    """默认模板渲染：argv 结构完整、无 shell（返回 list）。"""
+    """默认模板渲染：argv 结构完整、无 shell（返回 list）。
+
+    A1：模板依赖镜像 ENTRYPOINT 承担 `vllm serve`——字面量与渲染结果均不含
+    `{vllm_bin}`/serve；model_path 之后是 args 片段首 token（--port 补全）。
+    """
     cmd = _render_cmd(tmp_path)
     assert isinstance(cmd, list)
     assert cmd[0] == "docker" and cmd[1] == "run"
@@ -318,14 +322,20 @@ def test_render_docker_command_default_template(tmp_path):
     assert cmd[cmd.index("--shm-size") + 1] == "10g"
     assert cmd[cmd.index("--gpus") + 1] == "device=0,1"
     assert "vllm/vllm-openai:latest" in cmd
-    assert "vllm" in cmd and "serve" in cmd
-    assert str(tmp_path / "models" / "qwen2.5") in cmd
+    assert "serve" not in cmd  # A1：镜像 ENTRYPOINT 承担 vllm serve
+    model_dir = str(tmp_path / "models" / "qwen2.5")
+    assert model_dir in cmd
+    # model_path 之后是 args 片段首 token（--port 补全），不再漏 vllm_bin/serve
+    assert cmd[cmd.index(model_dir) + 1] == "--port"
     assert "--port" in cmd and "18080" in cmd
     assert "--served-model-name" in cmd
     # 挂载/env 片段经 split 还原为独立 argv
     assert "-v" in cmd
     assert f"{tmp_path}/models:{tmp_path}/models" in cmd
     assert "-e" in cmd
+    # A1：默认模板字面量不含 {vllm_bin}/serve（存量旧格式模板才用该键）
+    assert "{vllm_bin}" not in DEFAULT_VLLM_RUN_TEMPLATE
+    assert "serve" not in DEFAULT_VLLM_RUN_TEMPLATE
 
 
 def test_render_docker_command_missing_key_raises():
@@ -477,6 +487,18 @@ def test_inspect_no_such_container_returns_none(monkeypatch):
     assert inspect_container("vllm-i-1") is None
 
 
+def test_inspect_no_such_object_lowercase_returns_none(monkeypatch):
+    """D bug 防回归：stderr 大小写不敏感——colima docker 输出小写
+    `no such object`（而非标准 docker 大写 `No such object`）也应判容器不存在，
+    否则 stop_container 误判「无法确认停止」→ 恒 500。"""
+
+    def _fake_run(cmd, **kwargs):
+        return _fake_completed(1, stderr="error: no such object: vllm-i-1")
+
+    monkeypatch.setattr("app.worker.process_utils.subprocess.run", _fake_run)
+    assert inspect_container("vllm-i-1") is None
+
+
 def test_inspect_daemon_unreachable_raises(monkeypatch):
     """F1：daemon 不可达（stderr 含 `Cannot connect`）→ 上抛（restore 保留 meta）。"""
 
@@ -608,7 +630,9 @@ def test_stop_container_daemon_unreachable_returns_false(monkeypatch):
 
 
 def test_render_multi_word_vllm_bin(tmp_path):
-    """S5：vllm_bin 多词命令（如 `python -m vllm...`）→ 渲染 + split 还原为独立 argv。"""
+    """S5：vllm_bin 多词命令（如 `python -m vllm...`）→ 存量旧格式模板（含
+    {vllm_bin}）渲染 + split 还原为独立 argv；新默认模板不再含 {vllm_bin}
+    （镜像 ENTRYPOINT 承担 vllm serve，A1），多词 vllm_bin 不再注入默认模板。"""
     model_dir = tmp_path / "models" / "qwen2.5"
     model_dir.mkdir(parents=True)
     ctx = build_context(
@@ -625,7 +649,16 @@ def test_render_multi_word_vllm_bin(tmp_path):
         env_args="",
         mount_args="",
     )
-    cmd = render_docker_command(DEFAULT_VLLM_RUN_TEMPLATE, ctx)
+    # 存量旧格式模板（含 {vllm_bin} serve）仍可渲染多词 vllm_bin（兼容不 KeyError）
+    old_template = (
+        "docker run --name {name} {net_args} --shm-size {shm_size} "
+        "{gpus_args} {mount_args} {env_args} {image} "
+        "{vllm_bin} serve {model_path} {args}"
+    )
+    cmd = render_docker_command(old_template, ctx)
     assert "python" in cmd and "-m" in cmd
     assert "vllm.entrypoints.openai.api_server" in cmd
     assert cmd.index("python") < cmd.index("vllm.entrypoints.openai.api_server")
+    # 新默认模板渲染：不含 python/-m（多词 vllm_bin 不再注入默认模板）
+    cmd_new = render_docker_command(DEFAULT_VLLM_RUN_TEMPLATE, ctx)
+    assert "python" not in cmd_new and "-m" not in cmd_new

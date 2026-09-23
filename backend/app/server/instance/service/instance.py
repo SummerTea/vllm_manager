@@ -113,21 +113,24 @@ class VllmInstanceService(BaseCrudService[VllmInstance]):
         return inst
 
     async def stop(self, instance_id: str) -> VllmInstance:
-        """停止实例：running/starting/unreachable 可停止，置 target=stopping 并转发。
+        """停止实例：running/starting/unreachable/error 可停止，置 target=stopping 并转发。
 
-        转发失败抛 ExternalServiceException——target=stopping 的写入随事务回滚
-        （路由层对 VllmManagerException 统一 rollback），不落库，用户可重试。
+        C1：stop 守卫允许 error→stopping（error 实例可回收释放显存占账）；
+        delete 不改（仍保持阻断语义）。转发失败抛 ExternalServiceException——
+        target=stopping 的写入随事务回滚（路由层对 VllmManagerException 统一
+        rollback），不落库，用户可重试。
         """
         inst = await self.get_or_raise(instance_id)
         if inst.state not in (
             InstanceStateEnum.RUNNING.value,
             InstanceStateEnum.STARTING.value,
             InstanceStateEnum.UNREACHABLE.value,
+            InstanceStateEnum.ERROR.value,
         ):
             raise InvalidStateException(
                 "实例当前状态不允许停止",
                 current_state=inst.state,
-                expected_state="running/starting/unreachable",
+                expected_state="running/starting/unreachable/error",
             )
         inst.target_state = InstanceTargetStateEnum.STOPPING.value
         inst.target_retry_count = 0  # 每次用户操作重置对账重下发预算

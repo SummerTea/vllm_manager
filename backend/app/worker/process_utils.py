@@ -34,10 +34,13 @@ logger = logging.getLogger(__name__)
 # {net_args}/{gpus_args} 为结构性网络/GPU 差异片段，由 build_context 调用方按
 # gpu_indexes 派生：GPU 节点 --network host + --gpus device=，CPU-only 节点
 # -p {port}:{port} + 空串；CPU 三参数（--enforce-eager 等）走用户 args 透传）
+# A1：**镜像 ENTRYPOINT 承担 `vllm serve`**（官方 vllm-openai GPU/CPU 镜像
+# ENTRYPOINT=["vllm","serve"]）——模板 `{image}` 后直接是 `{model_path} {args}`，
+# 不再拼 `{vllm_bin} serve`（叠加会实执行 vllm serve vllm serve <path> → exit 2）；
+# `{vllm_bin}` 键仅存量模板兼容保留（build_context 仍填充，旧格式模板渲染不 KeyError）
 DEFAULT_VLLM_RUN_TEMPLATE = (
     "docker run --name {name} {net_args} --shm-size {shm_size} "
-    "{gpus_args} {mount_args} {env_args} {image} "
-    "{vllm_bin} serve {model_path} {args}"
+    "{gpus_args} {mount_args} {env_args} {image} {model_path} {args}"
 )
 
 
@@ -300,7 +303,9 @@ def inspect_container(container_name: str) -> dict | None:
     )
     if proc.returncode != 0:
         stderr = proc.stderr or ""
-        if "No such object" in stderr or "No such container" in stderr:
+        # 容器不存在分类**大小写不敏感**：docker 输出因发行版/版本而异——
+        # colima 等输出小写 `no such object`，标准 docker 大写 `No such object`
+        if "no such object" in stderr.lower() or "no such container" in stderr.lower():
             return None  # 容器不存在
         raise RuntimeError(  # 连接错误/未知错误：保守上抛，不误判容器消失
             f"docker inspect 容器 {container_name} 失败（code={proc.returncode}）: "

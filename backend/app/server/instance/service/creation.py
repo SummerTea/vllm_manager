@@ -44,10 +44,13 @@ from app.utils.request_to_worker import request_to_worker
 # {net_args}/{gpus_args} 为结构性网络/GPU 差异片段，由 worker 按
 # gpu_indexes 派生：GPU 节点 --network host + --gpus device=，CPU-only
 # 节点 -p {port}:{port} + 空串；CPU 三参数（--enforce-eager 等）走用户 args 透传）
+# A1：**镜像 ENTRYPOINT 承担 `vllm serve`**（官方 vllm-openai GPU/CPU 镜像
+# ENTRYPOINT=["vllm","serve"]）——模板 `{image}` 后直接是 `{model_path} {args}`，
+# 不再拼 `{vllm_bin} serve`（叠加会实执行 vllm serve vllm serve <path> → exit 2）；
+# `{vllm_bin}` 键仅存量模板兼容保留（build_context 仍填充，旧格式模板渲染不 KeyError）
 DEFAULT_VLLM_RUN_TEMPLATE = (
     "docker run --name {name} {net_args} --shm-size {shm_size} "
-    "{gpus_args} {mount_args} {env_args} {image} "
-    "{vllm_bin} serve {model_path} {args}"
+    "{gpus_args} {mount_args} {env_args} {image} {model_path} {args}"
 )
 
 

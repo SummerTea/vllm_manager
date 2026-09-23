@@ -225,6 +225,29 @@ def test_stop_invalid_state_400(api_client, monkeypatch):
     assert resp.status_code == 400
 
 
+def test_stop_error_state_ok(api_client, monkeypatch):
+    """C1：error 实例可停止（stop 守卫含 ERROR）→ 200 + target=stopping + 转发。"""
+    node = _ready_node(api_client)
+    inst = _create(api_client, monkeypatch)
+
+    calls = []
+
+    async def fake_request_to_worker(node, method, path, **kwargs):
+        calls.append(path)
+        return FakeResponse()
+
+    monkeypatch.setattr(
+        "app.server.instance.service.instance.request_to_worker",
+        fake_request_to_worker,
+    )
+
+    _report_state(api_client, node, inst["id"], "error")
+    resp = api_client.post(f"{_BASE}/{inst['id']}/stop")
+    assert resp.status_code == 200
+    assert resp.json()["data"]["target_state"] == "stopping"
+    assert calls == [f"instances/{inst['id']}/stop"]
+
+
 def test_delete_then_404(api_client, monkeypatch):
     node = _ready_node(api_client)
     inst = _create(api_client, monkeypatch)
