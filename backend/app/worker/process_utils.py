@@ -1,25 +1,41 @@
-"""Worker 进程/路径工具：端口分配、进程树终止、日志/meta 路径、模型路径解析。
+"""Worker 进程/路径工具：端口分配、docker 模板渲染、容器生命周期、日志/meta 路径。
+
+Phase B 容器化：实例启动由「Popen vllm serve」改为「Popen docker run」——
+- `render_docker_command` 模板渲染 → shlex.split → argv 交 Popen（**无 shell**）
+- 容器停止走 `stop_container`（docker stop/kill/rm），**绝不 killpg docker CLI**
+  （killpg 只杀 CLI 不杀容器 → 容器变孤儿）
+- 容器存活权威判定走 `inspect_container`（docker inspect）
 
 对齐 gpustack：
-- terminate_process_tree → utils/process.py:70（psutil 递归 children → SIGTERM → wait 3s → SIGKILL）
 - 端口分配 → serve_manager.py:_assign_ports（socket 探测 + 集合幂等）
 - 日志编号 → serve_manager.py:_get_numbered_log_path（{id}.{restart_count}.log）
+
+> S9：terminate_process_tree/_terminate/_kill 已移除——容器化后停止路径全部走
+> docker stop/kill/rm（killpg 会杀 CLI 不杀容器致孤儿），psutil 递归树无生产调用者。
 """
 
-import contextlib
+import json
 import logging
 import os
-import signal
+import shlex
 import socket
-import time
+import subprocess
 from pathlib import Path
 from typing import BinaryIO, TextIO
-
-import psutil
 
 from app.exception import NotFoundException
 
 logger = logging.getLogger(__name__)
+
+# 默认 docker 启动模板：**必须与 server 端
+# app/server/instance/service/start_template.py 的 DEFAULT_VLLM_RUN_TEMPLATE 逐字符一致**
+# （防漂移注记：worker-contract §2.2；worker 渲染 {port}/{model_path}/{gpu_indexes} 等
+# 由 worker 侧填写；缺省 template（含存量实例）用此内置模板兜底）
+DEFAULT_VLLM_RUN_TEMPLATE = (
+    "docker run --name {name} --network host --shm-size {shm_size} "
+    "--gpus device={gpu_indexes} {mount_args} {env_args} {image} "
+    "{vllm_bin} serve {model_path} {args}"
+)
 
 
 def get_free_port(host: str = "127.0.0.1", unavailable: set[int] | None = None) -> int:
@@ -35,53 +51,6 @@ def get_free_port(host: str = "127.0.0.1", unavailable: set[int] | None = None) 
         if port not in excluded:
             return port
     raise RuntimeError("无法分配空闲端口（排除集冲突次数过多）")
-
-
-def _terminate(pid: int) -> None:
-    """对进程组发 SIGTERM（进程不存在时静默容错）。"""
-    with contextlib.suppress(ProcessLookupError, PermissionError):
-        os.killpg(pid, signal.SIGTERM)
-
-
-def _kill(pid: int) -> None:
-    """对进程组发 SIGKILL（进程不存在时静默容错）。"""
-    with contextlib.suppress(ProcessLookupError, PermissionError):
-        os.killpg(pid, signal.SIGKILL)
-
-
-def terminate_process_tree(pid: int) -> None:
-    """终止进程树：killpg SIGTERM → 3s → SIGKILL + psutil 递归树兜底。
-
-    组合策略（vLLM 多进程可能脱离进程组，psutil 递归兜底）：
-    1. killpg(pid, SIGTERM)：Popen start_new_session 后进程组=pid，整组优雅退出
-    2. sleep(3)：等待优雅退出
-    3. killpg(pid, SIGKILL)：整组强杀
-    4. psutil 递归树兜底：children(recursive=True) → terminate → wait 3s → kill
-       （对齐 gpustack utils/process.py:terminate_process_tree）
-    """
-    _terminate(pid)
-    time.sleep(3)
-    _kill(pid)
-    try:
-        process = psutil.Process(pid)
-        children = process.children(recursive=True)
-    except psutil.NoSuchProcess:
-        return
-    except Exception:  # noqa: BLE001 - 兜底失败不影响主流程
-        logger.warning("psutil 递归树兜底失败: pid=%s", pid)
-        return
-    for child in children:
-        try:
-            child.terminate()
-        except psutil.NoSuchProcess:
-            continue
-    _, alive = psutil.wait_procs(children, timeout=3)
-    for child in alive:
-        try:
-            child.kill()
-        except psutil.NoSuchProcess:
-            continue
-    psutil.wait_procs(alive, timeout=1)
 
 
 def instance_log_path(log_dir: Path, instance_id: str, restart_count: int) -> Path:
@@ -173,20 +142,143 @@ def _has_arg(args: list[str], key: str) -> bool:
     )
 
 
-def build_env(env, cache_dir: Path, gpu_indexes: list[int]) -> dict:
-    """组装 vLLM 启动 env：继承 os.environ + 优化注入 + CUDA_VISIBLE_DEVICES。"""
-    result = dict(env)
-    result["OMP_NUM_THREADS"] = "1"
-    result["SAFETENSORS_FAST_GPU"] = "1"
-    cache_vllm = cache_dir / "vllm"
-    try:
-        cache_vllm.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        logger.warning("VLLM_CACHE_ROOT 目录创建失败: %s", cache_vllm)
-    else:
-        result["VLLM_CACHE_ROOT"] = str(cache_vllm)
-    result["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in gpu_indexes)
-    return result
+def build_env_args(env_items: dict[str, str]) -> str:
+    """组装 docker 环境变量片段：`-e K=V ...`（每项经 shlex.join 自动 quote）。
+
+    取代原 Popen env 用法（docker 用 -e 传参）：调用方负责构造 env_items
+    （OMP_NUM_THREADS/SAFETENSORS_FAST_GPU/VLLM_CACHE_ROOT 逻辑保留在调用方）。
+    返回片段已 quote，直接放入模板 {env_args} 占位即可。
+    """
+    parts: list[str] = []
+    for key, value in env_items.items():
+        parts.extend(["-e", f"{key}={value}"])
+    return join_arg_fragment(parts)
+
+
+def build_mount_args(mounts: list[tuple[str, str]]) -> str:
+    """组装 docker 挂载片段：`-v host:container ...`（每项经 shlex.join 自动 quote）。
+
+    同路径挂载时 host == container（模型根/缓存目录容器内同路径可见）。
+    返回片段已 quote，直接放入模板 {mount_args} 占位即可。
+    """
+    parts: list[str] = []
+    for host_path, container_path in mounts:
+        parts.extend(["-v", f"{host_path}:{container_path}"])
+    return join_arg_fragment(parts)
+
+
+def quote_arg(value: str) -> str:
+    """shlex.quote 包装单个占位值（防 shell 注入——渲染后虽无 shell，仍防御性 quote）。"""
+    return shlex.quote(value)
+
+
+def join_arg_fragment(parts: list[str]) -> str:
+    """shlex.join 拼接参数片段（自动 quote 含空格项），供模板 {args}/{env_args} 占位。"""
+    return shlex.join(parts)
+
+
+def build_context(
+    *,
+    name: str,
+    image: str,
+    vllm_bin: str,
+    model_path: str,
+    port: str,
+    gpu_indexes: str,
+    shm_size: str,
+    args_fragment: str,
+    env_args: str,
+    mount_args: str,
+) -> dict[str, str]:
+    """组装模板渲染上下文。
+
+    - name/image/model_path/shm_size 等用户/配置可控值经 quote_arg 防御
+    - vllm_bin 支持多词命令（如 `python -m vllm.entrypoints.openai.api_server`）：
+      shlex.split 展开为多 token 后 join（每 token quote），渲染 + split 还原为独立 argv
+    - args_fragment/env_args/mount_args 已是 shlex.join 后片段，**不再二次 quote**
+    - args 花括号（S2）**无需转义**：str.format 不解析替换值中的 `{`/`}`（原样输出）；
+      含空格 token 由 shlex.join 引号包裹 → shlex.split 正确还原（如
+      `{"max_tokens": 10}` 保持单 argv）；在值中做 `{`→`{{` 转义反而会输出双花括号
+    - port（数字）、gpu_indexes（"0,1"）无特殊字符直接给
+    """
+    return {
+        "name": quote_arg(name),
+        "image": quote_arg(image),
+        "vllm_bin": join_arg_fragment(shlex.split(vllm_bin)),
+        "model_path": quote_arg(model_path),
+        "port": str(port),
+        "gpu_indexes": gpu_indexes,
+        "shm_size": quote_arg(shm_size),
+        "args": args_fragment,
+        "env_args": env_args,
+        "mount_args": mount_args,
+    }
+
+
+def render_docker_command(template: str, context: dict[str, str]) -> list[str]:
+    """渲染 docker 启动命令：`template.format_map(context)` → `shlex.split` → argv。
+
+    - 返回 list 直接交 Popen（**无 shell**，参数不经过 shell 解释）
+    - 模板缺占位符 → KeyError 上抛（由调用方转 ERROR record）
+    - 占位值须已 quote（build_context/join_arg_fragment 负责），split 还原原始 argv
+    """
+    rendered = template.format_map(context)
+    return shlex.split(rendered)
+
+
+def stop_container(container_name: str) -> None:
+    """停止并清理容器：`docker stop -t 3` →（stop 失败时 `docker kill`）→ `docker rm`。
+
+    **绝不 killpg docker CLI 进程**——killpg 只杀 CLI 不杀容器，容器变孤儿；
+    容器必须走 docker 命令。docker 命令缺失/容器不存在等一律容错不抛。
+    """
+    def _run(cmd: list[str]) -> subprocess.CompletedProcess | None:
+        try:
+            return subprocess.run(cmd, capture_output=True, timeout=15)
+        except FileNotFoundError:
+            logger.warning("docker 命令不可用，无法操作容器 %s: %s", container_name, cmd)
+            return None
+        except subprocess.TimeoutExpired:
+            logger.warning("docker 命令超时（15s），继续下一步: %s", cmd)
+            return None
+        except OSError as e:  # noqa: BLE001 - daemon 不可达等容错
+            logger.warning("docker 操作失败 %s: %s", cmd, e)
+            return None
+
+    stop_proc = _run(["docker", "stop", "-t", "3", container_name])
+    if stop_proc is None or stop_proc.returncode != 0:
+        # stop 失败或状态未知（超时/异常/容器已停）→ kill 强杀兜底
+        _run(["docker", "kill", container_name])
+    _run(["docker", "rm", container_name])  # 清理容器（对不存在容器容错）
+
+
+def inspect_container(container_name: str) -> dict | None:
+    """`docker inspect` 容器状态（Gate 3 F1 三态语义）。
+
+    - **容器不存在**（返回码非 0 且 stderr 含 `No such object`/`No such container`）
+      → None（restore 据此删 meta）
+    - **探针异常 → 上抛**：docker 命令缺失（FileNotFoundError）/ 超时
+      （TimeoutExpired）/ daemon 不可达等连接错误（stderr 含 `Cannot connect`/
+      `Cannot reach`）/ 返回码非 0 但 stderr 无法归类 / 输出解析失败
+      （JSONDecodeError）——调用方（restore）据此**保留 meta + 告警**，
+      避免 docker 短暂不可用时误删全部 meta → 实例被对账 stopped → 显存超卖。
+    """
+    proc = subprocess.run(  # noqa: S603 - docker 命令；异常按 F1 上抛
+        ["docker", "inspect", container_name],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    if proc.returncode != 0:
+        stderr = proc.stderr or ""
+        if "No such object" in stderr or "No such container" in stderr:
+            return None  # 容器不存在
+        raise RuntimeError(  # 连接错误/未知错误：保守上抛，不误判容器消失
+            f"docker inspect 容器 {container_name} 失败（code={proc.returncode}）: "
+            f"{stderr.strip()}"
+        )
+    data = json.loads(proc.stdout)  # JSONDecodeError 上抛（探针异常）
+    return data[0] if data else None
 
 
 def open_log_file(path: Path) -> "TextIO | BinaryIO":

@@ -33,7 +33,13 @@ class WorkerConfig(AppBaseConfig):
         default=BASE_PATH / "data" / "models", description="模型根目录"
     )
     WORKER_VLLM_BIN: str = Field(
-        default="vllm", description="vLLM 可执行命令（PATH 或绝对路径）"
+        default="vllm", description="vLLM 可执行命令（PATH 或绝对路径，容器内命令）"
+    )
+    WORKER_VLLM_IMAGE: str = Field(
+        default="vllm/vllm-openai:latest", description="vLLM 容器镜像"
+    )
+    WORKER_VLLM_SHM_SIZE_GIB: float = Field(
+        default=10.0, description="共享内存 GiB，vLLM 大模型加载需要（--shm-size）"
     )
     WORKER_LOG_DIR: Path = Field(
         default=BASE_PATH / "data" / "logs", description="实例日志目录"

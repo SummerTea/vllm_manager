@@ -31,6 +31,10 @@ class StartRequest(BaseModel):
     spec: VllmSpec = Field(description="实例规格")
     gpu_indexes: list[int] = Field(description="分配的 GPU 索引列表")
     vram_claim: int = Field(description="显存需求（Bytes）")
+    template: str | None = Field(
+        default=None,
+        description="docker 启动模板快照（含 {var} 占位）；缺省 worker 用内置默认模板兜底",
+    )
 
 
 class StopRequest(BaseModel):

@@ -89,6 +89,26 @@ def test_start_accepted(client):
     assert resp.status_code == 200
     assert resp.json() == {"status": "accepted"}
     assert client.app.state.lifecycle.started[0][0] == "i-1"
+    assert client.app.state.lifecycle.started[0][1].template is None  # 缺省
+
+
+def test_start_accepted_with_template(client):
+    """StartRequest 接受 template 快照字段（server _build_start_payload 顶层下发）。"""
+    tpl = "docker run --name {name} --network host --shm-size {shm_size} {image}"
+    resp = client.post(
+        "/instances/i-1/start",
+        headers={"Authorization": "Bearer tok-1"},
+        json={
+            "instance_type": "vllm",
+            "spec": {"model_name": "qwen2.5"},
+            "gpu_indexes": [0],
+            "vram_claim": 16 * 1024**3,
+            "template": tpl,
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "accepted"}
+    assert client.app.state.lifecycle.started[0][1].template == tpl
 
 
 def test_stop_idempotent_with_token(client):
