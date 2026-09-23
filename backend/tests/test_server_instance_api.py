@@ -327,6 +327,20 @@ def test_report_route_not_captured(api_client):
     assert "对账 0 条" in resp.json()["message"]
 
 
+def test_report_invalid_state_422(api_client):
+    """worker-contract §1.4：上报非法 state 值由 FastAPI 直接 422（不进入对账逻辑）。"""
+    node = _ready_node(api_client)
+    resp = api_client.post(
+        f"{_BASE}/report",
+        headers=_auth(node["token"]),
+        json={"items": [{"id": "i-1", "state": "bogus-state"}]},
+    )
+
+    assert resp.status_code == 422
+    body = resp.json()
+    assert body["data"]["error_code"] == "VALIDATION_ERROR"
+
+
 def test_report_ok_persists(api_client, monkeypatch):
     node = _ready_node(api_client)
     inst = _create(api_client, monkeypatch)

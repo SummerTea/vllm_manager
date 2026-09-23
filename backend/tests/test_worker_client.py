@@ -133,6 +133,20 @@ async def test_register_4xx_immediate_raise(monkeypatch):
     assert len(fake.calls) == 1  # 仅调用一次，不进入重试
 
 
+async def test_register_5xx_immediate_raise(monkeypatch):
+    """5xx 业务错误立即抛（HTTPStatusError 不属于 TransportError，不重试）。"""
+
+    def _fail():
+        return httpx.Response(500, json={"code": -1, "message": "internal error"})
+
+    fake = _install_fake_client(monkeypatch, _fail)
+
+    client = _make_client()
+    with pytest.raises(httpx.HTTPStatusError):
+        await client.register()
+    assert len(fake.calls) == 1  # 仅调用一次，不进入重试
+
+
 # ---------- status / report ----------
 
 

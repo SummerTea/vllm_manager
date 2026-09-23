@@ -16,7 +16,7 @@ def _res(
     *,
     total: int = 24 * _GIB,
     count: int = 1,
-    gpu_type: str | list[str] = "A100",
+    gpu_type: str | list[str | None] = "A100",
     reserved: int = 0,
     allocated: dict[int, int] | None = None,
 ) -> WorkerResource:
@@ -180,3 +180,38 @@ def test_invalid_args_rejected():
     for kwargs in cases:
         result = AllocatorService.first_fit([worker], **kwargs)
         assert isinstance(result, AllocationRejected), kwargs
+
+
+def test_empty_candidates_rejected():
+    """空候选列表分支：无任何 worker 时返回「无可用节点」（first_failure 保持 None）。"""
+    result = AllocatorService.first_fit(
+        [], vram_claim=10 * _GIB, gpu_memory_utilization=0.9
+    )
+    assert isinstance(result, AllocationRejected)
+    assert result.reason == "无可用节点"
+
+
+def test_multi_gpu_unknown_type_grouped_hit():
+    """gpu_type=None 的卡归入 <unknown> 分组：同组两张卡 tp=2 可命中。"""
+    worker = _res(count=2, gpu_type=[None, None])
+    result = AllocatorService.first_fit(
+        [worker],
+        vram_claim=40 * _GIB,
+        gpu_memory_utilization=0.9,
+        tensor_parallel_size=2,
+    )
+    assert isinstance(result, AllocationResult)
+    assert result.gpu_indexes == [0, 1]
+
+
+def test_multi_gpu_unknown_type_not_merged_with_named():
+    """<unknown> 分组与命名型号不合并：未知型号卡 + A100 卡凑 tp=2 被拒。"""
+    worker = _res(count=2, gpu_type=["A100", None])
+    result = AllocatorService.first_fit(
+        [worker],
+        vram_claim=40 * _GIB,
+        gpu_memory_utilization=0.9,
+        tensor_parallel_size=2,
+    )
+    assert isinstance(result, AllocationRejected)
+    assert "无足够同型号卡" in result.reason

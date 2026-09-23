@@ -37,6 +37,41 @@ def test_get_free_port_avoids_unavailable():
     p2 = get_free_port(unavailable={p1})
     assert p2 != p1
 
+def test_get_free_port_100_conflicts_raises(monkeypatch):
+    """socket 探测始终落入排除集 → 100 次冲突耗尽 → RuntimeError（无法分配空闲端口）。
+
+    替换 process_utils.socket 模块引用（而非全局 patch 标准库 socket.socket），
+    避免污染测试进程内其他 socket 使用点。
+    """
+
+    class _FakeSocket:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def bind(self, addr):
+            pass
+
+        def getsockname(self):
+            return ("127.0.0.1", 9999)
+
+    import socket as _socket
+    from types import SimpleNamespace
+
+    fake_socket_mod = SimpleNamespace(
+        socket=_FakeSocket,
+        AF_INET=_socket.AF_INET,
+        SOCK_STREAM=_socket.SOCK_STREAM,
+    )
+    monkeypatch.setattr("app.worker.process_utils.socket", fake_socket_mod)
+    with pytest.raises(RuntimeError, match="无法分配空闲端口"):
+        get_free_port(unavailable={9999})
+
 
 # ---------- 路径 ----------
 

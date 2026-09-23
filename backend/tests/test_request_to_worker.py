@@ -149,3 +149,19 @@ async def test_request_network_error_raises_external_exception(monkeypatch):
 
     assert excinfo.value.details["service_name"] == "worker"
     assert excinfo.value.details["url"] == "http://10.0.0.1:8100/instances/i-1/start"
+
+
+async def test_request_timeout_raises_external_exception(monkeypatch):
+    """httpx.TimeoutException（HTTPError 非 HTTPStatusError）→ ExternalServiceException。"""
+    node = _node()
+
+    def _raise_timeout():
+        raise httpx.TimeoutException("request timed out")
+
+    _install_fake_client(monkeypatch, _raise_timeout)
+
+    with pytest.raises(ExternalServiceException) as excinfo:
+        await request_to_worker(node, "post", "instances/i-1/start")
+
+    assert excinfo.value.details["service_name"] == "worker"
+    assert excinfo.value.details["url"] == "http://10.0.0.1:8100/instances/i-1/start"

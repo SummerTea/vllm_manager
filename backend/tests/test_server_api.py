@@ -205,6 +205,18 @@ def test_status_requires_token(api_client):
     assert resp.status_code == 401
 
 
+def test_status_wrong_token_401(api_client):
+    """status 上报携带不属于任何节点的 token → 401（get_current_node 无效令牌分支）。"""
+    data = _register(api_client)
+    resp = api_client.post(
+        f"{_BASE}/{data['node_id']}/status",
+        headers=_auth("no-such-token"),
+        json={},
+    )
+
+    assert resp.status_code == 401
+
+
 def test_status_wrong_node_403(api_client):
     a = _register(api_client, machine_id="m-a", hostname="gpu-a")
     b = _register(api_client, machine_id="m-b", hostname="gpu-b")

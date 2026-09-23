@@ -95,6 +95,33 @@ def test_collect_gpu_nvml_init_failed(monkeypatch, caplog):
     assert "nvmlInit 失败" in caplog.text
 
 
+def test_collect_gpu_device_get_count_error_degrades(monkeypatch, caplog):
+    """nvmlDeviceGetCount 抛 NVMLError → gpu_devices==[]，不抛异常（降级 + 告警一次）。"""
+
+    class _FakeNVMLError(Exception):
+        pass
+
+    nvml = SimpleNamespace(
+        nvmlInit=lambda: None,
+        nvmlShutdown=lambda: None,
+        nvmlDeviceGetCount=lambda: (_ for _ in ()).throw(_FakeNVMLError("nvml error")),
+        NVMLError=_FakeNVMLError,
+    )
+    monkeypatch.setattr(collector_mod, "pynvml", nvml)
+    monkeypatch.setattr(collector_mod, "_PYNVML_AVAILABLE", True)
+    monkeypatch.setattr(collector_mod, "_warned_init_failed", False)  # 隔离前序用例的告警标志
+    collector = _make_collector()
+
+    payload = collector.collect()
+    assert payload["status"]["gpu_devices"] == []
+    assert "nvmlDeviceGetCount 失败" in caplog.text
+
+    # 告警一次语义：第二次采集不再重复告警
+    caplog.clear()
+    assert collector.collect()["status"]["gpu_devices"] == []
+    assert "nvmlDeviceGetCount 失败" not in caplog.text
+
+
 def test_collect_gpu_single_card_failure_skips(monkeypatch):
     """单卡采集异常跳过该卡，不拖垮整次采集。"""
     nvml = SimpleNamespace(

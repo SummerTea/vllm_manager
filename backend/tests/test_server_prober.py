@@ -13,8 +13,12 @@ from typing import Any
 import httpx
 import pytest
 
+import app.server.instance.model  # noqa: F401  (注册 VllmInstance 到 Base.metadata)
 import app.server.node.model  # noqa: F401  (注册 Node 到 Base.metadata)
 from app.config import app_config
+from app.server.instance.enum import InstanceStateEnum
+from app.server.instance.model import VllmInstance
+from app.server.instance.service import VllmInstanceService
 from app.server.node.enum import NodeStateEnum
 from app.server.node.prober import _probe_node, probe_loop
 from app.server.node.schema import NodeRegisterRequest
@@ -287,3 +291,93 @@ async def test_probe_loop_callback_not_called_when_no_lost(session, monkeypatch)
     assert calls == []
     assert node.state == NodeStateEnum.READY.value
     assert node.unreachable is False
+
+
+async def test_probe_loop_reconcile_lost_nodes_end_to_end(session, monkeypatch):
+    """C2 端到端联动（回调非 stub）：probe 判定节点 OFFLINE → 真实
+    reconcile_lost_nodes 联动 → 该节点下 running 实例置 unreachable 并落库。"""
+    svc = NodeService(session)
+    node = await svc.register(_req())
+    grace = app_config.NODE_HEARTBEAT_GRACE_PERIOD
+    node.heartbeat_time = datetime.now() - timedelta(seconds=grace + 5)  # 存活超时
+    # running 实例挂在失联节点下（直接内存构造，不经 allocator）
+    inst = VllmInstance(
+        node_id=node.id,
+        state=InstanceStateEnum.RUNNING.value,
+        target_state="none",
+        model_name="qwen2.5-7b",
+        gpu_indexes=[0],
+        args=[],
+        labels={},
+        allocated_vram={},
+        restart_count=0,
+    )
+    session.add(inst)
+    await session.flush()
+
+    # 回调不 stub：与 lifespan 组合根装配一致，真实执行 instance 域批量失联联动
+    async def on_node_lost(s, lost_nodes):
+        await VllmInstanceService(s).reconcile_lost_nodes(lost_nodes)
+
+    @asynccontextmanager
+    async def _ctx():
+        yield session
+
+    async def _no_sleep(_: float) -> None:
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr("app.server.node.prober.get_session_context", _ctx)
+    monkeypatch.setattr("app.server.node.prober.asyncio.sleep", _no_sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await probe_loop(on_node_lost=on_node_lost)
+
+    # 联动已生效：节点 offline，实例 unreachable + 失联文案
+    assert node.state == NodeStateEnum.OFFLINE.value
+    assert inst.state == InstanceStateEnum.UNREACHABLE.value
+    assert inst.state_message == "节点失联"
+
+    # 落库校验：提交后强制从库重读仍为 unreachable
+    # （先固化 id，expire_all 后属性访问会触发同步懒加载 → MissingGreenlet）
+    instance_id = inst.id
+    await session.commit()
+    session.expire_all()
+    reloaded = await VllmInstanceService(session).get_by_id(instance_id)
+    assert reloaded is not None
+    assert reloaded.state == InstanceStateEnum.UNREACHABLE.value
+
+
+async def test_probe_loop_callback_exception_isolated(session, monkeypatch):
+    """C2：on_node_lost 抛异常被隔离（不冒泡、不退出循环），下一轮继续执行。"""
+    svc = NodeService(session)
+    node = await svc.register(_req())
+    grace = app_config.NODE_HEARTBEAT_GRACE_PERIOD
+    node.heartbeat_time = datetime.now() - timedelta(seconds=grace + 5)  # 存活超时
+    await session.flush()
+
+    calls = {"callback": 0, "sleep": 0}
+
+    async def on_node_lost(s, lost_nodes):
+        calls["callback"] += 1
+        if calls["callback"] == 1:
+            raise RuntimeError("回调异常（应被隔离）")
+
+    @asynccontextmanager
+    async def _ctx():
+        yield session
+
+    async def _no_sleep(_: float) -> None:
+        calls["sleep"] += 1
+        if calls["sleep"] == 1:
+            return  # 第一轮结束放行，进入第二轮
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr("app.server.node.prober.get_session_context", _ctx)
+    monkeypatch.setattr("app.server.node.prober.asyncio.sleep", _no_sleep)
+
+    # 只可能因 CancelledError 退出：回调的 RuntimeError 被循环内 except Exception 吞掉
+    with pytest.raises(asyncio.CancelledError):
+        await probe_loop(on_node_lost=on_node_lost)
+
+    assert calls["callback"] == 2  # 第二轮回调正常执行（循环未被第一轮异常打断）
+    assert calls["sleep"] == 2  # 第一轮异常后仍进入 sleep，进入下一轮
