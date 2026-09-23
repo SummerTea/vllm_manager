@@ -25,13 +25,13 @@
 | 3 | **选卡判定（first-fit）** | `vllm_resource_fit_selector.py:401`：逐卡判 `① available/total ≥ GMU ② vram_claim ≤ total×GMU`；多卡 TP 时按 allocatable 率降序累加 + `num_attention_heads % tp == 0` 整除校验 | 单卡/多卡 TP 直接照抄三条件；多卡时 worker 本地读 `config.json` 校验 TP 整除 |
 | 4 | **决策结果 → 启动参数注入** | 调度结果回写 `gpu_indexes`；worker `_get_selected_gpu_devices()` 按卡过滤，`get_auto_parallelism_arguments()` 自动补 `--tensor-parallel-size N`（vllm.py:1028） | 决策结果 `{node_id, gpu_indexes, gmu}` 随启停指令下发；worker 渲染 `--gpus device={gpu_indexes}` 透传（容器内 CUDA 索引=宿主索引，**无 CUDA_VISIBLE_DEVICES**）+ 多卡补 `--tensor-parallel-size`，GMU 用户参数透传 |
 | 5 | **健康检查 = HTTP 而非进程存活** | `is_ready()`（serve_manager.py:1741）：`GET /v1/models` 1s 超时 200 即 running | `running` 判定 = 进程存活 && `/v1/models` 200（1s 超时）；同时是启动超时/失败判定的标准答案 |
-| 6 | **启动失败显式落 ERROR + state_message** | `_start_model_instance()` except 分支（serve_manager.py:1392）写 ERROR + 可读原因 | worker 启动 try/except，失败信息写入 `state_message` 随心跳上报，server 直接展示 |
+| 6 | **启动失败显式落 ERROR + state_message** | `_start_model_instance()` except 分支（serve_manager.py:1392）写 ERROR + 可读原因 | worker 启动 try/except，失败信息写入 `state_message` 随状态上报，server 直接展示 |
 | 7 | **psutil 递归树终止兜底 killpg** | `terminate_process_tree()`（utils/process.py:70）：psutil 递归 children → SIGTERM → 3s → SIGKILL | 保留为宿主机进程工具参考（S9 已从 worker 移除）；**docker 场景用 `docker stop -t 3 → kill → rm`**（killpg 杀 CLI 不杀容器致孤儿） |
 | 8 | **注册幂等下发 token + 配置** | `POST /v2/workers`（routes/workers.py:613）：一次返回 `token + worker_config`；按 uuid/name 重注册**复用旧 token 不轮换**（幂等） | server node 表加 `token` 列（`secrets.token_hex(24)`）；注册按 hostname 幂等，重注册返回原 token |
-| 9 | **心跳与状态上报分离** | `/worker-heartbeat`（空 body 只记 ID）vs `/worker-status`（全量载荷）；5s 缓冲批量落库（worker_status_buffer.py） | 保留两端点分离；server 低并发直接落库，可选照抄 20 行批量 UPDATE |
+| 9 | **心跳与状态上报分离** | `/worker-heartbeat`（空 body 只记 ID）vs `/worker-status`（全量载荷）；5s 缓冲批量落库（worker_status_buffer.py） | 心跳职责并入状态上报（status 上报承担存活语义，刷新 `heartbeat_time`）；server 低并发直接落库，可选照抄 20 行批量 UPDATE |
 | 10 | **离线判定收敛为 compute_state()** | `Worker.compute_state()`（schemas/workers.py:379）：心跳超时→NOT_READY + 可读文案；主动探测失败→UNREACHABLE | Node 模型加 `compute_state()`（30s 心跳超时→offline + state_message）；保留 `/healthz` 主动探测（15 行）区分「worker 死 vs 断网」 |
-| 11 | **实例 target_state + state 双字段** | gpustack 单 state 多方写（worker PUT 回写）；停止=删实例 | 我们需显式停止 → `target_state ∈ {none, starting, stopping}`（server 写）+ `state ∈ {pending, starting, running, stopping, stopped, error, unreachable}`（心跳实例列表驱动对齐） |
-| 12 | **实例对账 = 心跳实例列表** | worker 直接 PUT 实例状态，server 不猜 | 心跳载荷内嵌实例列表，server 与 DB 逐实例对账（新增/消失/迁移），达成目标态后清 target_state |
+| 11 | **实例 target_state + state 双字段** | gpustack 单 state 多方写（worker PUT 回写）；停止=删实例 | 我们需显式停止 → `target_state ∈ {none, starting, stopping}`（server 写）+ `state ∈ {pending, starting, running, stopping, stopped, error, unreachable}`（实例快照上报驱动对齐） |
+| 12 | **实例对账 = 心跳实例列表** | worker 直接 PUT 实例状态，server 不猜 | 周期上报实例快照（`/instances/report` 载荷），server 与 DB 逐实例对账（新增/消失/迁移），达成目标态后清 target_state |
 | 13 | **env 优化注入** | `_get_configured_env()`（vllm.py:356）：`OMP_NUM_THREADS=1`、`SAFETENSORS_FAST_GPU=1`、`VLLM_CACHE_ROOT` 持久目录 | 直接采纳前两个；VLLM_CACHE_ROOT 指向 worker 持久目录（可选） |
 | 14 | **日志按 restart_count 编号轮转** | `{log_dir}/serve/{id}.{restart_count}.log`（serve_manager.py:890） | `logs/{instance_id}.{n}.log` 轮转，崩溃可回看上一轮 |
 | 15 | **周期对账 + 指数退避重启** | `sync_model_instances_state()` 周期权威判定；`_restart_error_model_instance()`：`delay = min(10·2ⁿ, 300s)` | worker `sync_loop()`（3-5s）：starting 超时→error；error 且允许重启→退避置回 starting（本项目口径，见 worker-contract §3）；单次异常不终止线程 |
@@ -60,7 +60,7 @@
 | 多节点分布式 | Ray/MP 跨机、`subordinate_workers`、`distributed_servers`、多机拓扑——单实例单机 |
 | 调度队列/重调度/评分链 | `AsyncUniqueQueue`、ANALYZING 门控、BINPACK/SPREAD 评分、ModelFileLocality——first-fit 足够 |
 | 多后端 | SGLang/MindIE/VoxBox/Custom 分派——backend 固定 vLLM |
-| 容器 WorkloadPlan | gpustack-runtime create_workload 等——直接 docker run 即可 | **排除 gpustack-runtime 容器编排全栈**（WorkloadPlan/create_workload/registry/k8s/gpustack-runtime 守护）；落地为 **server 模板表（vllm_manager_vllm_start_template）+ worker 模板渲染 docker run**（`--network host`/`--shm-size`/`--gpus` 透传，与 gpustack host_network=True + shm 10GiB + resources[gpus] 实证对齐） |
+| 容器 WorkloadPlan | gpustack-runtime create_workload 等——直接 docker run 即可 | **排除 gpustack-runtime 容器编排全栈**（WorkloadPlan/create_workload/registry/k8s/gpustack-runtime 守护）；落地为 **creation.py 内置 `DEFAULT_VLLM_RUN_TEMPLATE` 常量快照下发 + worker 模板渲染 docker run**（`--network host`/`--shm-size`/`--gpus` 透传，与 gpustack host_network=True + shm 10GiB + resources[gpus] 实证对齐） |
 | 模型文件下载管理 | ModelFileManager、HF/GGUF 解析——vllm serve 自管模型加载 |
 | 多租户 | TenantContext/principals/api_keys 全套——单管理端单租户 |
 | 多实例 HA | leader 选举、coordinator、LocalCoordinator——单管理端进程 |
@@ -104,10 +104,10 @@
 
 ### server↔worker 契约
 
-- **注册**：`POST /api/nodes/register` 幂等（按 hostname 匹配）→ 响应 `{node_id, token, worker_port, heartbeat_interval}`；重注册不轮换 token
-- **心跳**：`POST /api/nodes/{id}/heartbeat` 空 body 记时间；`POST /api/nodes/{id}/status` 全量（GPU 状态 + 实例列表）
+- **注册**：`POST /api/nodes/register` 幂等（按 hostname 匹配）→ 响应 `{node_id, token, worker_port}`；重注册不轮换 token
+- **状态上报**：`POST /api/nodes/{id}/status` 全量（GPU 状态 + 实例列表），承担存活语义（刷新 `heartbeat_time`）
 - **鉴权**：worker 所有管理端点 Bearer `{node.token}`（注册端点例外）；server 统一 `request_to_worker()` 转发
-- **对齐**：用户操作 → 写 target_state + 转发指令 → 心跳实例列表对账 → 达成后清 target_state；节点 offline → 其实例置 unreachable（不自动删除，人工介入）
+- **对齐**：用户操作 → 写 target_state + 转发指令 → 实例快照对账（report）→ 达成后清 target_state；节点 offline → 其实例置 unreachable（不自动删除，人工介入）
 
 ---
 

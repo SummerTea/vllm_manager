@@ -35,13 +35,6 @@ async def lifespan(app: FastAPI):
     if "db" not in app_config.DISABLED_EXTENSIONS:
         await init_db(create_tables=(app_config.DEPLOY_ENV == "DEVELOPMENT"))
 
-        # 2.1 预制 vLLM 启动模板（表空才插，幂等）
-        from app.server.instance.service.start_template import (
-            seed_start_templates,
-        )
-
-        await seed_start_templates()
-
     # 3. 初始化 Redis
     if "redis" not in app_config.DISABLED_EXTENSIONS:
         await init_redis()
@@ -50,19 +43,19 @@ async def lifespan(app: FastAPI):
     if "saq" not in app_config.DISABLED_EXTENSIONS:
         await init_saq()
 
-    # 5. 启动节点主动探测后台任务（依赖 DB，db 禁用时不启动）
+    # 5. 启动节点主动探测后台任务（依赖 DB，db 禁用时不启动）。
+    #    探测失联回调（on_node_lost）在此组合根装配：probe 把 OFFLINE/UNREACHABLE
+    #    节点批量交给 instance 域联动（running→unreachable）。跨域装配只发生在这里，
+    #    node 域零跨域 import（回调是参数）。
     prober_task: asyncio.Task | None = None
     if "db" not in app_config.DISABLED_EXTENSIONS:
+        from app.server.instance.service import VllmInstanceService
         from app.server.node.prober import probe_loop
 
-        prober_task = asyncio.create_task(probe_loop())
+        async def _on_node_lost(session, lost_nodes) -> None:
+            await VllmInstanceService(session).reconcile_lost_nodes(lost_nodes)
 
-    # 6. 启动实例失联对账后台任务（依赖 DB，db 禁用时不启动）
-    reconcile_task: asyncio.Task | None = None
-    if "db" not in app_config.DISABLED_EXTENSIONS:
-        from app.server.instance.reconciler import reconcile_loop
-
-        reconcile_task = asyncio.create_task(reconcile_loop())
+        prober_task = asyncio.create_task(probe_loop(on_node_lost=_on_node_lost))
 
     yield
 
@@ -71,11 +64,6 @@ async def lifespan(app: FastAPI):
         prober_task.cancel()
         with suppress(asyncio.CancelledError):
             await prober_task
-
-    if reconcile_task is not None:
-        reconcile_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await reconcile_task
 
     if "redis" not in app_config.DISABLED_EXTENSIONS:
         await close_redis()

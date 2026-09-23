@@ -11,7 +11,6 @@ def test_worker_config_defaults():
     assert cfg.WORKER_ADVERTISE_ADDRESS is None
     assert cfg.WORKER_STATUS_INTERVAL == 15
     assert cfg.WORKER_REPORT_INTERVAL == 5
-    assert cfg.NODE_HEARTBEAT_INTERVAL == 10
     assert cfg.INSTANCE_DEFAULT_GMU == 0.9
     assert cfg.WORKER_SYSTEM_RESERVED_RAM == 0
     assert cfg.WORKER_SYSTEM_RESERVED_VRAM == 0

@@ -17,7 +17,7 @@ vLLM 推理服务集群管理平台。**server 端（节点/实例/allocator）+
 | 入口 | 位置 | 端口 | 说明 |
 |------|------|------|------|
 | backend server | `backend/app/main:app` | 8000 | Web + REST 管理端（lifespan：init_logging→db→redis→saq） |
-| backend worker | `backend/app/work_worker.py`（`python app/work_worker.py`） | 8100 | 管控节点（GPU 机器，**不连 PG，不初始化任何扩展**——无 DB/Redis 依赖，无需 `DISABLED_EXTENSIONS`；默认 `--host 0.0.0.0`，端口由 `WORKER_LISTEN_PORT` 配置，server 跨机回连硬约束；**依赖 docker + `WORKER_VLLM_IMAGE`（vllm/vllm-openai）容器启动 vLLM**，启动命令模板化——server 模板表下发快照，worker 渲染 docker run） |
+| backend worker | `backend/app/work_worker.py`（`python app/work_worker.py`） | 8100 | 管控节点（GPU 机器，**不连 PG，不初始化任何扩展**——无 DB/Redis 依赖，无需 `DISABLED_EXTENSIONS`；默认 `--host 0.0.0.0`，端口由 `WORKER_LISTEN_PORT` 配置，server 跨机回连硬约束；**依赖 docker + `WORKER_VLLM_IMAGE`（vllm/vllm-openai）容器启动 vLLM**，启动命令模板化——server 内置 `DEFAULT_VLLM_RUN_TEMPLATE` 常量快照下发，worker 渲染 docker run） |
 | backend SAQ worker | `backend/app/work_saq.py` | — | `python app/work_saq.py -q default` |
 | frontend SPA | `frontend/` | 5178(dev) | 管理页面，访问路径 `/vllm_manager/frontend/` |
 
@@ -43,7 +43,7 @@ vllm_manager/
 │   │   │   ├── config.py              # WorkerConfig（SERVER_URL/监听端口/模型根目录/周期/预留）
 │   │   │   ├── enum.py                # WorkerInstanceStateEnum（pending/starting/running/stopping/error）
 │   │   │   ├── schema.py              # StartRequest/StopRequest/WeightRequest/VllmSpec
-│   │   │   ├── server_client.py       # ServerClient（注册重试/心跳/状态/实例对账上报）
+│   │   │   ├── server_client.py       # ServerClient（注册重试/状态/实例对账上报）
 │   │   │   ├── collector.py           # GPU/系统采集（pynvml 优雅降级）
 │   │   │   ├── main.py                # create_app + lifespan（注册→restore→后台循环）
 │   │   │   ├── exceptions.py          # JSON-only 异常处理器（独立于 server）
@@ -120,7 +120,7 @@ bun run build                    # 构建（tsc + vite）
 
 **分层与跨层约束**：
 - 调用链单向：`API → Service → CRUD → Model`；跨层传递用 Pydantic Schema，**禁止把 ORM 实例直接透给前端**
-- `async` 函数中不要直接跑 CPU 密集/同步阻塞逻辑，用 `app.utils.concurrency.make_async` 包装
+- `async` 函数中不要直接跑 CPU 密集/同步阻塞逻辑，用 `asyncio.to_thread`（单个调用）或 `asyncio.gather`（并发调用）包装
 - 新增 Model/Service/API/Test 前，先读 `backend/tests/` 样板契约测试的写法，保持风格一致
 
 ## 后端验证

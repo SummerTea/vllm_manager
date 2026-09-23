@@ -1,44 +1,12 @@
 """Server 模块 vLLM 实例数据模型。"""
 
-from sqlalchemy import BigInteger, Boolean, Float, Index, Integer, String
+from sqlalchemy import BigInteger, Float, Index, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.base.base_model import BaseModel, IdMixin, UniversalJSON, UniversalText
 from app.extensions.database import db_config
 from app.server.instance.base import InstanceLifecycleMixin
 from app.server.instance.enum import InstanceTaskEnum
-
-
-class VllmStartTemplate(IdMixin, BaseModel):
-    """vLLM 启动模板表（docker run 模板，create 时快照到实例）。"""
-
-    __tablename__ = f"{db_config.TABLE_NAME_PREFIX}_vllm_start_template"
-    __table_args__ = (
-        Index("uix_vllm_start_template_key", "template_key", unique=True),
-        {"comment": "vLLM 启动模板"},
-    )
-
-    template_key: Mapped[str] = mapped_column(
-        String(64), comment="模板唯一键"
-    )
-    instance_type: Mapped[str] = mapped_column(
-        String(32), default="vllm", comment="实例类型"
-    )
-    template: Mapped[str] = mapped_column(
-        UniversalText, comment="docker 启动模板（{var} 占位）"
-    )
-    description: Mapped[str | None] = mapped_column(
-        UniversalText, nullable=True, comment="模板说明"
-    )
-    is_active: Mapped[bool] = mapped_column(
-        Boolean, default=True, comment="是否启用"
-    )
-    is_default: Mapped[bool] = mapped_column(
-        Boolean, default=False, comment="是否默认模板"
-    )
-    labels: Mapped[dict] = mapped_column(
-        UniversalJSON, default=dict, comment="标签"
-    )
 
 
 class VllmInstance(IdMixin, InstanceLifecycleMixin, BaseModel):

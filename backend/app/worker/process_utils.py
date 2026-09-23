@@ -28,7 +28,7 @@ from app.exception import NotFoundException
 logger = logging.getLogger(__name__)
 
 # 默认 docker 启动模板：**必须与 server 端
-# app/server/instance/service/start_template.py 的 DEFAULT_VLLM_RUN_TEMPLATE 逐字符一致**
+# server/instance/service/creation.py 的 DEFAULT_VLLM_RUN_TEMPLATE 逐字符一致**
 # （防漂移注记：worker-contract §2.2；worker 渲染 {port}/{model_path}/{gpu_indexes} 等
 # 由 worker 侧填写；缺省 template（含存量实例）用此内置模板兜底）
 DEFAULT_VLLM_RUN_TEMPLATE = (

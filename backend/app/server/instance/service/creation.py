@@ -33,10 +33,19 @@ from app.server.instance.base import estimate_vram_claim
 from app.server.instance.enum import InstanceStateEnum, InstanceTargetStateEnum
 from app.server.instance.model import VllmInstance
 from app.server.instance.schema import VllmInstanceCreateRequest
-from app.server.instance.service.start_template import VllmStartTemplateService
 from app.server.node.enum import NodeStateEnum
 from app.server.node.model import Node
 from app.utils.request_to_worker import request_to_worker
+
+# server 内置默认 docker 启动模板：**必须与 worker 侧
+# app/worker/process_utils.py 的 DEFAULT_VLLM_RUN_TEMPLATE 逐字符一致**
+# （防漂移注记：worker-contract §2.2；create 直落本常量快照下发，
+# worker 渲染 {port}/{model_path}/{gpu_indexes} 等由 worker 侧填写）
+DEFAULT_VLLM_RUN_TEMPLATE = (
+    "docker run --name {name} --network host --shm-size {shm_size} "
+    "--gpus device={gpu_indexes} {mount_args} {env_args} {image} "
+    "{vllm_bin} serve {model_path} {args}"
+)
 
 
 class NodeReadOnlyCrud(BaseCrudService[Node]):
@@ -82,12 +91,6 @@ async def create_vllm_instance(
     session: AsyncSession, data: VllmInstanceCreateRequest
 ) -> VllmInstance:
     """创建 vLLM 实例的请求内编排（不提交事务，由路由层统一提交）。"""
-    # 0. 解析启动模板（无效 template_key 在候选节点/权重广播/allocator 前失败，
-    #    零外部副作用；成功则固化快照供建记录使用）
-    template = await VllmStartTemplateService(session).resolve_template(
-        data.template_key
-    )
-
     # 1. 候选节点：is_active 且重派生状态为 ready
     node_crud = NodeReadOnlyCrud(session)
     candidates: list[Node] = []
@@ -156,7 +159,7 @@ async def create_vllm_instance(
 
     # 5-7. 分配决策与建记录需串行化：聚合 allocator 输入 → first_fit 决策 → 建记录
     # 并 flush 整体加锁，防并发 create 读到彼此尚未落库（或未提交）的记录造成超卖。
-    # 步骤 0-4（模板/候选/权重）与步骤 8（转发 start）留在锁外，避免持锁做网络 IO。
+    # 步骤 1-4（候选/权重）与步骤 8（转发 start）留在锁外，避免持锁做网络 IO。
     async with _get_create_lock():
         # PG 事务级 advisory lock：跨请求/跨事务串行化，随事务提交/回滚自动释放，
         # 覆盖「锁内写、锁外提交」导致的 READ COMMITTED 可见性窗口（Gate 1 P0-1）。
@@ -205,7 +208,7 @@ async def create_vllm_instance(
                 "显存分配失败", operation="create", reason=result.reason
             )
 
-        # 7. 建记录并 flush（template 快照固化；生成 id 供转发指令使用）
+        # 7. 建记录并 flush（template 固化内置默认模板快照；生成 id 供转发指令使用）
         inst = VllmInstance(
             node_id=result.node_id,
             state=InstanceStateEnum.PENDING.value,
@@ -219,7 +222,7 @@ async def create_vllm_instance(
             task=data.task.value,
             model_weight_bytes=model_weight_bytes,
             args=data.args or [],
-            template=template,
+            template=DEFAULT_VLLM_RUN_TEMPLATE,
             restart_count=0,
         )
         session.add(inst)

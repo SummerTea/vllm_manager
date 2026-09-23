@@ -291,3 +291,13 @@ class VllmInstanceService(BaseCrudService[VllmInstance]):
             inst.state_message = "节点失联"
         await self.session.flush()
         return len(instances)
+
+    async def reconcile_lost_nodes(self, nodes: list[Node]) -> int:
+        """批量失联联动：逐节点调用 reconcile_node_loss（内部已 flush），返回处理条数。
+
+        供 prober 失联回调使用（组合根注入），多个失联节点一次联动完成落库。
+        """
+        total = 0
+        for node in nodes:
+            total += await self.reconcile_node_loss(node)
+        return total

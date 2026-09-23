@@ -33,9 +33,6 @@ class VllmInstanceCreateRequest(BaseModel):
     node_id: str | None = Field(
         default=None, description="指定节点 ID（须为就绪节点，否则拒绝）"
     )
-    template_key: str | None = Field(
-        default=None, description="指定启动模板键，缺省取默认模板"
-    )
 
 
 class VllmInstanceOut(BaseModel):
@@ -78,53 +75,6 @@ class VllmInstanceOut(BaseModel):
         default=None, description="启动模板快照（docker run 模板，create 时固化）"
     )
     is_active: bool = Field(description="是否启用")
-    created_at: datetime = Field(description="创建时间")
-    updated_at: datetime | None = Field(default=None, description="更新时间")
-
-
-class VllmStartTemplateCreateRequest(BaseModel):
-    """vLLM 启动模板创建请求。"""
-
-    template_key: str = Field(
-        min_length=1, max_length=64, description="模板唯一键"
-    )
-    instance_type: str = Field(
-        default="vllm", max_length=32, description="实例类型"
-    )
-    template: str = Field(
-        min_length=1, description="docker 启动模板（含 {var} 占位）"
-    )
-    description: str | None = Field(default=None, description="模板说明")
-    is_active: bool = Field(default=True, description="是否启用")
-    is_default: bool = Field(default=False, description="是否默认模板")
-    labels: dict | None = Field(default=None, description="标签")
-
-
-class VllmStartTemplateUpdateRequest(BaseModel):
-    """vLLM 启动模板更新请求。"""
-
-    template: str | None = Field(
-        default=None, min_length=1, description="docker 启动模板（含 {var} 占位）"
-    )
-    description: str | None = Field(default=None, description="模板说明")
-    is_active: bool | None = Field(default=None, description="是否启用")
-    is_default: bool | None = Field(default=None, description="是否默认模板")
-    labels: dict | None = Field(default=None, description="标签")
-
-
-class VllmStartTemplateOut(BaseModel):
-    """vLLM 启动模板响应。"""
-
-    model_config = ConfigDict(from_attributes=True)
-
-    id: str = Field(description="模板 ID")
-    template_key: str = Field(description="模板唯一键")
-    instance_type: str = Field(description="实例类型")
-    template: str = Field(description="docker 启动模板（{var} 占位）")
-    description: str | None = Field(default=None, description="模板说明")
-    is_active: bool = Field(description="是否启用")
-    is_default: bool = Field(description="是否默认模板")
-    labels: dict = Field(default_factory=dict, description="标签")
     created_at: datetime = Field(description="创建时间")
     updated_at: datetime | None = Field(default=None, description="更新时间")
 

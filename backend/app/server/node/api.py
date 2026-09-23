@@ -8,7 +8,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.base.base_request_schema import PaginationParams
 from app.base.base_response_schema import BaseResponse, EmptyResponse, PageResponse
-from app.config import app_config
 from app.exception import ForbiddenException, ResourceNotExistException
 from app.extensions.database import get_session
 
@@ -28,7 +27,7 @@ from app.server.node.service import NodeService
 
 # 安全姿态（过渡期）：
 # 管理端点（list/get/patch/delete）当前暂未接入会话鉴权，仅 worker 端点
-# （heartbeat/status/register 走节点 token）。管理端点开放是过渡姿态，待 web
+# （status/register 走节点 token）。管理端点开放是过渡姿态，待 web
 # 鉴权里程碑接入会话鉴权后收敛。部署约束：仅限内网/本机可达，禁止直接暴露公网。
 node_router = APIRouter(prefix="/nodes", tags=["节点管理"])
 
@@ -64,26 +63,8 @@ async def register_node(
             node_id=node.id,
             token=node.token,
             worker_port=node.worker_port,
-            heartbeat_interval=app_config.NODE_HEARTBEAT_INTERVAL,
         )
     )
-
-
-@node_router.post("/{node_id}/heartbeat", response_model=BaseResponse[None])
-async def node_heartbeat(
-    node_id: str,
-    current_node: Annotated[Node, Depends(get_current_node)],
-    session: Annotated[AsyncSession, Depends(get_session)],
-) -> BaseResponse[None]:
-    """节点心跳（worker 鉴权）。"""
-    if current_node.id != node_id:
-        raise ForbiddenException("节点令牌与目标节点不匹配")
-    node = await NodeService(session).heartbeat(node_id)
-    if node is None:
-        raise ResourceNotExistException(
-            "节点不存在", resource_type="node", resource_id=node_id
-        )
-    return BaseResponse.success()
 
 
 @node_router.post("/{node_id}/status", response_model=BaseResponse[None])

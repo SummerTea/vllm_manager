@@ -69,7 +69,6 @@ def test_register_public_returns_token(api_client):
     assert data["node_id"]
     assert data["token"]
     assert data["worker_port"] == 8100
-    assert data["heartbeat_interval"] == 10
 
 
 def test_register_idempotent_same_token(api_client):
@@ -78,47 +77,6 @@ def test_register_idempotent_same_token(api_client):
 
     assert second["node_id"] == first["node_id"]
     assert second["token"] == first["token"]
-
-
-def test_heartbeat_requires_token(api_client):
-    resp = api_client.post(f"{_BASE}/some-id/heartbeat")
-
-    assert resp.status_code == 401
-
-
-def test_heartbeat_wrong_token_401(api_client):
-    data = _register(api_client)
-    resp = api_client.post(
-        f"{_BASE}/{data['node_id']}/heartbeat",
-        headers=_auth("wrong-token"),
-    )
-
-    assert resp.status_code == 401
-
-
-def test_heartbeat_ok_with_token(api_client):
-    data = _register(api_client)
-    resp = api_client.post(
-        f"{_BASE}/{data['node_id']}/heartbeat",
-        headers=_auth(data["token"]),
-    )
-    assert resp.status_code == 200
-
-    # 心跳后 DB 中 state 应派生为 ready（经详情接口验证）
-    detail = api_client.get(f"{_BASE}/{data['node_id']}")
-    assert detail.status_code == 200
-    assert detail.json()["data"]["state"] == "ready"
-
-
-def test_heartbeat_wrong_node_403(api_client):
-    a = _register(api_client, machine_id="m-a", hostname="gpu-a")
-    b = _register(api_client, machine_id="m-b", hostname="gpu-b")
-    resp = api_client.post(
-        f"{_BASE}/{b['node_id']}/heartbeat",
-        headers=_auth(a["token"]),
-    )
-
-    assert resp.status_code == 403
 
 
 def test_status_report_ok(api_client):

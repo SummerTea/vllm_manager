@@ -15,7 +15,6 @@ import logging
 
 from fastapi import FastAPI
 from fastapi.responses import RedirectResponse
-from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 
 logger = logging.getLogger(__name__)
@@ -36,18 +35,6 @@ app = FastAPI(
     lifespan=app_lifespan,
     docs_url=f"{app_config.BASE_URL_PATH}/docs",
     redoc_url=f"{app_config.BASE_URL_PATH}/redoc",
-)
-
-# CORS 配置
-# 注意：allow_origins=["*"] + allow_credentials=True 是浏览器规范的无效组合
-# （浏览器会拒绝带凭据的跨域请求）；样板依赖 dev proxy/同源部署，
-# 分域部署时需改为显式 origin 列表。
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
 )
 
 # Cookie Session 配置（认证由业务方自行接入，如登录接口写入 user_id）

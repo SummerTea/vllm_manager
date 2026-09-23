@@ -9,8 +9,10 @@
 
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable
 
 import httpx
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import app_config
 from app.extensions.database import get_session_context
@@ -24,8 +26,8 @@ logger = logging.getLogger(__name__)
 async def _probe_node(
     service: NodeService, client: httpx.AsyncClient, node: Node
 ) -> None:
-    """单节点探测：先按心跳派生状态，再决定是否探测 /healthz。"""
-    # 第一次 compute_state 决定是否探测（心跳权威信号先行）
+    """单节点探测：先按 status 上报派生状态，再决定是否探测 /healthz。"""
+    # 第一次 compute_state 决定是否探测（status 上报权威信号先行）
     node.compute_state(app_config.NODE_HEARTBEAT_GRACE_PERIOD)
     if node.state in (NodeStateEnum.PENDING.value, NodeStateEnum.OFFLINE.value):
         await service.refresh_state(node)  # 心跳未到/已超时，不探测（healthz 无法区分死因）
@@ -49,8 +51,15 @@ async def _probe_node(
     await service.refresh_state(node)
 
 
-async def probe_loop() -> None:
-    """周期扫描所有节点（含 is_active=False，供管理员参考存活），异常不退出循环。"""
+async def probe_loop(
+    on_node_lost: Callable[[AsyncSession, list[Node]], Awaitable] | None = None,
+) -> None:
+    """周期扫描所有节点（含 is_active=False，供管理员参考存活），异常不退出循环。
+
+    可选回调 on_node_lost：每轮探测后把派生为 OFFLINE/UNREACHABLE 的节点批量交给
+    组合根注入的联动处理（如实例域失联联动）。跨域装配只发生在 lifespan 组合根
+    （node 域不 import instance 域，回调是参数注入），缺省 None 时仅探测不发联动。
+    """
     while True:
         try:
             async with get_session_context() as session:
@@ -61,6 +70,15 @@ async def probe_loop() -> None:
                 ) as client:
                     for node in nodes:
                         await _probe_node(service, client, node)
+                if on_node_lost is not None:
+                    lost_nodes = [
+                        node
+                        for node in nodes
+                        if node.state
+                        in (NodeStateEnum.OFFLINE.value, NodeStateEnum.UNREACHABLE.value)
+                    ]
+                    if lost_nodes:
+                        await on_node_lost(session, lost_nodes)
         except asyncio.CancelledError:
             raise
         except Exception:

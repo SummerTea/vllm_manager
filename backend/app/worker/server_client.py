@@ -1,8 +1,8 @@
-"""worker→server 通信客户端（注册/心跳/状态上报/实例对账）。
+"""worker→server 通信客户端（注册/状态上报/实例对账）。
 
 对齐 docs/worker-contract.md §1：路径带 /vllm_manager/api/v1 前缀，
 响应统一 BaseResponse{code, message, data}，业务数据在 data 字段。
-注册失败重试耗尽抛异常（启动失败退出）；心跳/状态/对账失败仅 warning 不抛（长驻容错）。
+注册失败重试耗尽抛异常（启动失败退出）；状态/对账失败仅 warning 不抛（长驻容错）。
 """
 
 import logging
@@ -26,7 +26,6 @@ class NodeRegisterResponse(BaseModel):
     node_id: str = Field(description="节点 ID")
     token: str = Field(description="Bearer 鉴权令牌")
     worker_port: int = Field(description="worker 端口")
-    heartbeat_interval: int = Field(description="建议心跳间隔（秒）")
 
 
 def _get_first_non_loopback_ip() -> str:
@@ -77,16 +76,6 @@ class ServerClient:
         )
         resp.raise_for_status()
         return NodeRegisterResponse.model_validate(resp.json()["data"])
-
-    async def heartbeat(self, node_id: str, token: str) -> None:
-        """发送心跳（失败仅 warning，不抛——长驻容错）。"""
-        try:
-            await self._http.post(
-                f"{self._config.SERVER_URL}{_BASE_API_PATH}/nodes/{node_id}/heartbeat",
-                headers=self._headers(token),
-            )
-        except Exception as e:  # noqa: BLE001 - 上报失败不应中断 worker
-            logger.warning("心跳上报失败: %s", e)
 
     async def report_status(self, node_id: str, token: str, payload: dict) -> None:
         """上报节点状态（失败仅 warning，不抛）。"""

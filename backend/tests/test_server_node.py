@@ -65,17 +65,6 @@ async def test_register_hostname_fallback(session):
     assert second.token == first.token
 
 
-async def test_heartbeat_sets_ready(session):
-    svc = NodeService(session)
-    node = await svc.register(_req())
-    assert node.state == NodeStateEnum.PENDING.value
-
-    hb = await svc.heartbeat(node.id)
-    assert hb is not None
-    assert hb.heartbeat_time is not None
-    assert hb.state == NodeStateEnum.READY.value
-
-
 async def test_compute_state_offline_after_grace(session):
     svc = NodeService(session)
     node = await svc.register(_req())
@@ -127,11 +116,11 @@ async def test_update_status_persists_json(session):
 async def test_register_not_set_heartbeat(session):
     svc = NodeService(session)
     node = await svc.register(_req())
-    await svc.heartbeat(node.id)
+    await svc.update_status(node.id, NodeStatusReportRequest())
     assert node.heartbeat_time is not None
     hb_time = node.heartbeat_time
 
     again = await svc.register(_req(ip="10.0.0.9"))
     assert again.id == node.id
-    # liveness 归心跳端点，注册不刷新心跳时间
+    # liveness 归状态上报端点，注册不刷新存活时间
     assert again.heartbeat_time == hb_time

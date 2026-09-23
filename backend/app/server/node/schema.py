@@ -94,7 +94,6 @@ class NodeRegisterResponse(BaseModel):
     node_id: str = Field(description="节点 ID")
     token: str = Field(description="Bearer 鉴权令牌")
     worker_port: int = Field(description="worker 端口")
-    heartbeat_interval: int = Field(description="建议心跳间隔（秒）")
 
 
 class NodeStatusReportRequest(BaseModel):

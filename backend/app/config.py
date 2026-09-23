@@ -75,9 +75,6 @@ class AppConfig(AppBaseConfig):
     )
 
     # Node 域配置（Server 模块）
-    NODE_HEARTBEAT_INTERVAL: int = Field(
-        description="建议心跳间隔（秒），注册时下发给 worker", default=10
-    )
     NODE_HEARTBEAT_GRACE_PERIOD: int = Field(
         description="心跳超时阈值（秒），超过则节点置 offline", default=30
     )
@@ -95,9 +92,6 @@ class AppConfig(AppBaseConfig):
     )
     INSTANCE_WEIGHT_TIMEOUT: int = Field(
         description="权重广播查询超时（秒）", default=15
-    )
-    INSTANCE_RECONCILE_INTERVAL: int = Field(
-        description="实例失联对账周期（秒）", default=15
     )
 
     # Allocator 域配置（Server 模块）

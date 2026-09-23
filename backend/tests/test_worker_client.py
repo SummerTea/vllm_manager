@@ -1,4 +1,4 @@
-"""Worker ServerClient 契约测试（注册/心跳/状态/对账）。
+"""Worker ServerClient 契约测试（注册/状态上报/实例对账）。
 
 模式：monkeypatch 模块内 httpx.AsyncClient 捕获请求参数（对齐
 test_request_to_worker.py 的 fake client 模式）；tenacity 重试用
@@ -53,7 +53,6 @@ def _reg_response(**overrides):
         "node_id": "node-1",
         "token": "tok-1",
         "worker_port": 8100,
-        "heartbeat_interval": 10,
     }
     data.update(overrides)
     return httpx.Response(200, json={"code": 0, "message": "success", "data": data})
@@ -71,7 +70,6 @@ async def test_register_success_parses_data(monkeypatch):
     assert reg.node_id == "node-1"
     assert reg.token == "tok-1"
     assert reg.worker_port == 8100
-    assert reg.heartbeat_interval == 10
     assert fake.calls[0]["url"] == f"{_BASE}/nodes/register"
     body = fake.calls[0]["kwargs"]["json"]
     assert body["machine_id"] == body["hostname"]  # 未配 machine_id 用主机名
@@ -135,31 +133,7 @@ async def test_register_4xx_immediate_raise(monkeypatch):
     assert len(fake.calls) == 1  # 仅调用一次，不进入重试
 
 
-# ---------- heartbeat / status / report ----------
-
-
-async def test_heartbeat_sends_bearer_and_url(monkeypatch):
-    fake = _install_fake_client(monkeypatch, lambda: httpx.Response(200))
-
-    client = _make_client()
-    await client.heartbeat("node-1", "tok-1")
-
-    call = fake.calls[0]
-    assert call["url"] == f"{_BASE}/nodes/node-1/heartbeat"
-    assert call["kwargs"]["headers"] == {"Authorization": "Bearer tok-1"}
-
-
-async def test_heartbeat_failure_only_warns(monkeypatch, caplog):
-    """心跳失败仅 warning 不抛（长驻容错）。"""
-
-    def _fail():
-        raise httpx.ConnectError("connection refused")
-
-    _install_fake_client(monkeypatch, _fail)
-
-    client = _make_client()
-    await client.heartbeat("node-1", "tok-1")  # 不应抛异常
-    assert "心跳上报失败" in caplog.text
+# ---------- status / report ----------
 
 
 async def test_report_status_sends_payload(monkeypatch):

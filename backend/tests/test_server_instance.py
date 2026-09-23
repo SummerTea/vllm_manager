@@ -21,7 +21,6 @@ from app.exception import (
     HttpClientException,
     InvalidStateException,
     OperationNotAllowedException,
-    ResourceNotExistException,
 )
 from app.server.instance.base import (
     apply_report,
@@ -41,13 +40,10 @@ from app.server.instance.schema import (
     VllmInstanceCreateRequest,
 )
 from app.server.instance.service import VllmInstanceService
+from app.server.instance.service.creation import DEFAULT_VLLM_RUN_TEMPLATE
 from app.server.instance.service.instance import (
     _MAX_STOP_REDISPATCH,
     _pending_redispatch_tasks,
-)
-from app.server.instance.service.start_template import (
-    DEFAULT_VLLM_RUN_TEMPLATE,
-    seed_start_templates,
 )
 from app.server.node.model import Node
 from app.server.node.schema import (
@@ -85,7 +81,7 @@ async def _ready_node(session, *, machine_id: str = "m-001") -> Node:
             worker_port=8100,
         )
     )
-    await svc.heartbeat(node.id)
+    # update_status 刷新存活时间（heartbeat_time）并派生状态，承担节点存活语义
     await svc.update_status(
         node.id,
         NodeStatusReportRequest(
@@ -369,45 +365,26 @@ async def test_create_success(session, monkeypatch):
 
 
 async def test_create_snapshots_default_template(session, monkeypatch):
-    """create 缺省 template_key：快照默认模板内容（seed 后为 vllm-default）。"""
-    await seed_start_templates(session)
+    """create 快照 server 内置 DEFAULT_VLLM_RUN_TEMPLATE 常量（无模板表/template_key）。"""
     await _ready_node(session)
 
     inst = await _create_ready_instance(session, monkeypatch)
 
     assert inst.template is not None
-    assert "docker run" in inst.template
     assert inst.template == DEFAULT_VLLM_RUN_TEMPLATE
 
 
-async def test_create_snapshots_specified_template(session, monkeypatch):
-    """create 指定 template_key：快照对应模板内容。"""
-    await seed_start_templates(session)
-    await _ready_node(session)
+def test_default_template_matches_worker():
+    """server 内置 DEFAULT_VLLM_RUN_TEMPLATE 与 worker 侧逐字符一致（防漂移回归锁定）。
 
-    inst = await _create_ready_instance(
-        session, monkeypatch, template_key="vllm-gpus-env"
+    跨域 import 是**有意的**：漂移检测需要双方实值比对；测试级引用不破坏 worker
+    运行时隔离（worker 运行不 import server 域，仅此测试做一致性格栅锁）。
+    """
+    from app.worker.process_utils import (
+        DEFAULT_VLLM_RUN_TEMPLATE as worker_tpl,
     )
 
-    assert inst.template is not None
-    assert "NVIDIA_VISIBLE_DEVICES" in inst.template
-
-
-async def test_create_unknown_template_rejected(session, monkeypatch):
-    """create 指定未知模板键 → ResourceNotExistException，实例不落库。"""
-    await seed_start_templates(session)
-    await _ready_node(session)
-    await session.commit()  # 固化节点前置
-
-    with pytest.raises(ResourceNotExistException) as excinfo:
-        await _create_ready_instance(
-            session, monkeypatch, template_key="no-such-template"
-        )
-    assert excinfo.value.details["resource_type"] == "vllm_start_template"
-
-    await session.rollback()
-    found = await VllmInstanceService(session).get_by_field("model_name", "qwen2.5")
-    assert found is None
+    assert DEFAULT_VLLM_RUN_TEMPLATE == worker_tpl
 
 
 async def test_create_with_task_embedding(session, monkeypatch):
@@ -1148,6 +1125,49 @@ async def test_reconcile_node_loss(session, monkeypatch):
     assert running.state == InstanceStateEnum.UNREACHABLE.value
     assert running.state_message == "节点失联"
     assert error.state == InstanceStateEnum.ERROR.value
+
+
+async def test_reconcile_lost_nodes_batch(session, monkeypatch):
+    """C2：批量失联联动——多个失联节点的 running 实例全部置 unreachable，返回处理条数。"""
+    node1 = await _ready_node(session, machine_id="m-001")
+    node2 = await _ready_node(session, machine_id="m-002")
+    running1 = await _create_ready_instance(session, monkeypatch)
+    running1.state = InstanceStateEnum.RUNNING.value
+    # node2 下再内存构造一条 running（避开 allocator 单卡占满约束）
+    running2 = VllmInstance(
+        node_id=node2.id,
+        state=InstanceStateEnum.RUNNING.value,
+        target_state="none",
+        model_name="qwen2.5-7b",
+        gpu_indexes=[0],
+        args=[],
+        labels={},
+        allocated_vram={},
+        restart_count=0,
+    )
+    session.add(running2)
+    await session.flush()
+
+    count = await VllmInstanceService(session).reconcile_lost_nodes([node1, node2])
+
+    assert count == 2
+    assert running1.state == InstanceStateEnum.UNREACHABLE.value
+    assert running1.state_message == "节点失联"
+    assert running2.state == InstanceStateEnum.UNREACHABLE.value
+    assert running2.state_message == "节点失联"
+
+
+async def test_reconcile_lost_nodes_no_running(session, monkeypatch):
+    """C2：批量失联联动——节点下无 running 实例时返回 0，不误伤 error/stopped 实例。"""
+    node = await _ready_node(session)
+    inst = await _create_ready_instance(session, monkeypatch)
+    inst.state = InstanceStateEnum.ERROR.value
+    await session.flush()
+
+    count = await VllmInstanceService(session).reconcile_lost_nodes([node])
+
+    assert count == 0
+    assert inst.state == InstanceStateEnum.ERROR.value
 
 
 async def test_assert_node_deletable(session, monkeypatch):

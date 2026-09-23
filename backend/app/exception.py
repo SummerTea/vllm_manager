@@ -69,20 +69,6 @@ class HttpException(VllmManagerException):
         super().__init__(message, code, details)
 
 
-class BadRequestException(HttpException):
-    """400 错误请求"""
-
-    status_code = 400
-
-    def __init__(
-        self,
-        message: str = "请求参数错误",
-        code: str = "BAD_REQUEST",
-        details: dict[str, Any] | None = None,
-    ):
-        super().__init__(message, code, details)
-
-
 class UnauthorizedException(HttpException):
     """401 未认证"""
 
@@ -134,62 +120,6 @@ class ConflictException(HttpException):
         self,
         message: str = "资源冲突",
         code: str = "CONFLICT",
-        details: dict[str, Any] | None = None,
-    ):
-        super().__init__(message, code, details)
-
-
-class ValidationException(HttpException):
-    """422 验证失败"""
-
-    status_code = 422
-
-    def __init__(
-        self,
-        message: str = "数据验证失败",
-        code: str = "VALIDATION_ERROR",
-        details: dict[str, Any] | None = None,
-    ):
-        super().__init__(message, code, details)
-
-
-class RateLimitException(HttpException):
-    """429 请求过于频繁"""
-
-    status_code = 429
-
-    def __init__(
-        self,
-        message: str = "请求过于频繁，请稍后重试",
-        code: str = "RATE_LIMIT_EXCEEDED",
-        details: dict[str, Any] | None = None,
-    ):
-        super().__init__(message, code, details)
-
-
-class InternalServerException(HttpException):
-    """500 服务器内部错误"""
-
-    status_code = 500
-
-    def __init__(
-        self,
-        message: str = "服务器内部错误",
-        code: str = "INTERNAL_SERVER_ERROR",
-        details: dict[str, Any] | None = None,
-    ):
-        super().__init__(message, code, details)
-
-
-class ServiceUnavailableException(HttpException):
-    """503 服务不可用"""
-
-    status_code = 503
-
-    def __init__(
-        self,
-        message: str = "服务暂时不可用",
-        code: str = "SERVICE_UNAVAILABLE",
         details: dict[str, Any] | None = None,
     ):
         super().__init__(message, code, details)
@@ -342,21 +272,6 @@ class RedisException(ExternalServiceException):
         details: dict[str, Any] | None = None,
     ):
         super().__init__(message, "REDIS_ERROR", "redis", details)
-
-
-class LLMServiceException(ExternalServiceException):
-    """LLM 服务异常"""
-
-    def __init__(
-        self,
-        message: str = "LLM 服务调用失败",
-        model: str | None = None,
-        details: dict[str, Any] | None = None,
-    ):
-        details = details or {}
-        if model:
-            details["model"] = model
-        super().__init__(message, "LLM_SERVICE_ERROR", "llm", details)
 
 
 class HttpClientException(ExternalServiceException):

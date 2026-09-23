@@ -76,9 +76,9 @@ def _auth(token: str) -> dict:
 
 
 def _ready_node(client: TestClient, **overrides) -> dict:
-    """注册 + 心跳 + 状态上报（1 卡 24GiB、system_reserved vram=2GiB）→ ready。"""
+    """注册 + 状态上报（1 卡 24GiB、system_reserved vram=2GiB）→ ready。"""
     data = _register(client, **overrides)
-    client.post(f"{_NODES}/{data['node_id']}/heartbeat", headers=_auth(data["token"]))
+    # status 上报刷新存活时间（heartbeat_time）并派生状态，承担节点存活语义
     client.post(
         f"{_NODES}/{data['node_id']}/status",
         headers=_auth(data["token"]),
@@ -373,91 +373,3 @@ def test_report_ignores_foreign_instance(api_client, monkeypatch):
     # 非本节点实例未被改动
     detail = api_client.get(f"{_BASE}/{inst['id']}")
     assert detail.json()["data"]["state"] == InstanceStateEnum.PENDING.value
-
-
-# ---------- /start-templates 模板管理端点 ----------
-
-_TEMPLATES = f"{_BASE}/start-templates"
-
-
-def test_start_templates_crud(api_client):
-    # create
-    resp = api_client.post(
-        _TEMPLATES,
-        json={
-            "template_key": "api-tpl",
-            "template": "docker run --name {name} {image} {args}",
-            "description": "api 创建",
-        },
-    )
-    assert resp.status_code == 200
-    assert resp.json()["data"]["template_key"] == "api-tpl"
-    assert resp.json()["data"]["is_default"] is False
-
-    # duplicate create → 409 DUPLICATE_RESOURCE（全局 handler 约定：重复资源 409）
-    resp = api_client.post(
-        _TEMPLATES, json={"template_key": "api-tpl", "template": "dup"}
-    )
-    assert resp.status_code == 409
-    assert resp.json()["data"]["error_code"] == "DUPLICATE_RESOURCE"
-
-    # list 含新建
-    resp = api_client.get(_TEMPLATES)
-    assert resp.status_code == 200
-    assert resp.json()["code"] == 0
-    assert any(
-        item["template_key"] == "api-tpl"
-        for item in resp.json()["data"]["items"]
-    )
-
-    # get by key / get missing
-    resp = api_client.get(f"{_TEMPLATES}/api-tpl")
-    assert resp.status_code == 200
-    resp = api_client.get(f"{_TEMPLATES}/no-such")
-    assert resp.status_code == 404
-
-    # patch
-    resp = api_client.patch(
-        f"{_TEMPLATES}/api-tpl", json={"description": "更新说明"}
-    )
-    assert resp.status_code == 200
-    assert resp.json()["data"]["description"] == "更新说明"
-
-    # delete
-    resp = api_client.delete(f"{_TEMPLATES}/api-tpl")
-    assert resp.status_code == 200
-    resp = api_client.get(f"{_TEMPLATES}/api-tpl")
-    assert resp.status_code == 404
-
-
-def test_start_templates_route_not_captured(api_client):
-    """路由顺序：/start-templates 固定路径不被 /{instance_id} 捕获。"""
-    # GET /start-templates 命中列表而非 /{instance_id} 详情（后者会对
-    # "start-templates" 查无实例返回 404）
-    resp = api_client.get(_TEMPLATES)
-    assert resp.status_code == 200
-    assert resp.json()["code"] == 0
-
-    # POST /start-templates 命中创建而非实例创建
-    resp = api_client.post(
-        _TEMPLATES,
-        json={"template_key": "route-tpl", "template": "docker run {args}"},
-    )
-    assert resp.status_code == 200
-    assert resp.json()["data"]["template_key"] == "route-tpl"
-
-
-def test_delete_default_template_forbidden(api_client):
-    resp = api_client.post(
-        _TEMPLATES,
-        json={"template_key": "new-default", "template": "x", "is_default": True},
-    )
-    assert resp.status_code == 200
-
-    resp = api_client.delete(f"{_TEMPLATES}/new-default")
-    assert resp.status_code == 400
-    assert resp.json()["data"]["error_code"] == "OPERATION_NOT_ALLOWED"
-
-    # 默认模板仍存在
-    resp = api_client.get(f"{_TEMPLATES}/new-default")
-    assert resp.status_code == 200

@@ -215,3 +215,75 @@ async def test_probe_loop_success_path(session, monkeypatch):
     assert calls["sleep"] == 1  # 跑完一轮进入 sleep
     assert node.state == NodeStateEnum.READY.value
     assert node.unreachable is False
+
+
+async def test_probe_loop_callback_called_on_lost(session, monkeypatch):
+    """C2：注入 on_node_lost 回调——失联（offline）节点被批量触发并携带会话。"""
+    svc = NodeService(session)
+    node = await svc.register(_req())
+    grace = app_config.NODE_HEARTBEAT_GRACE_PERIOD
+    node.heartbeat_time = datetime.now() - timedelta(seconds=grace + 5)  # 存活超时
+    await session.flush()
+
+    calls: list[tuple[Any, list[Any]]] = []
+
+    async def on_node_lost(s, lost_nodes):
+        calls.append((s, lost_nodes))
+
+    @asynccontextmanager
+    async def _ctx():
+        yield session
+
+    async def _no_sleep(_: float) -> None:
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr("app.server.node.prober.get_session_context", _ctx)
+    monkeypatch.setattr("app.server.node.prober.asyncio.sleep", _no_sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await probe_loop(on_node_lost=on_node_lost)
+
+    assert len(calls) == 1
+    assert calls[0][0] is session  # 回调在探测同一会话内执行
+    assert [n.id for n in calls[0][1]] == [node.id]
+    assert node.state == NodeStateEnum.OFFLINE.value
+
+
+async def test_probe_loop_callback_not_called_when_no_lost(session, monkeypatch):
+    """C2：无失联节点时 on_node_lost 不触发（健康节点正常探测到 ready）。"""
+    svc = NodeService(session)
+    node = await svc.register(_req())
+    node.heartbeat_time = datetime.now()  # 存活新鲜
+    await session.flush()
+
+    calls: list[tuple[Any, list[Any]]] = []
+
+    async def on_node_lost(s, lost_nodes):
+        calls.append((s, lost_nodes))
+
+    @asynccontextmanager
+    async def _ctx():
+        yield session
+
+    def _client_factory(*args, **kwargs) -> httpx.AsyncClient:
+        async def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200)
+
+        return _ORIGINAL_ASYNC_CLIENT(
+            transport=httpx.MockTransport(handler),
+            timeout=app_config.NODE_PROBE_TIMEOUT,
+        )
+
+    async def _no_sleep(_: float) -> None:
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr("app.server.node.prober.get_session_context", _ctx)
+    monkeypatch.setattr("app.server.node.prober.httpx.AsyncClient", _client_factory)
+    monkeypatch.setattr("app.server.node.prober.asyncio.sleep", _no_sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await probe_loop(on_node_lost=on_node_lost)
+
+    assert calls == []
+    assert node.state == NodeStateEnum.READY.value
+    assert node.unreachable is False

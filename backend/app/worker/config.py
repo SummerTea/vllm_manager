@@ -53,9 +53,6 @@ class WorkerConfig(AppBaseConfig):
     WORKER_REPORT_INTERVAL: int = Field(
         default=5, description="实例对账上报周期（秒，Phase 2 使用）"
     )
-    NODE_HEARTBEAT_INTERVAL: int = Field(
-        default=10, description="心跳周期默认（秒，注册响应可覆盖）"
-    )
     INSTANCE_DEFAULT_GMU: float = Field(
         default=0.9, description="实例默认显存利用率 GMU（0-1，缺省补参数）"
     )

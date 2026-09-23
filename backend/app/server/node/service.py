@@ -17,7 +17,7 @@ class NodeService(BaseCrudService[Node]):
         """节点注册（幂等）。
 
         - 幂等键：machine_id 非空按 machine_id 匹配，否则按 hostname 匹配。
-        - 已存在：复用旧 token（不轮换），刷新可变字段，不写 heartbeat_time（liveness 归心跳端点）。
+        - 已存在：复用旧 token（不轮换），刷新可变字段，不写 heartbeat_time（liveness 归状态上报端点）。
         - 不存在：新建 pending 节点并下发新 token。
         """
         if data.machine_id:
@@ -43,16 +43,6 @@ class NodeService(BaseCrudService[Node]):
             )
             self.session.add(node)
 
-        await self.session.flush()
-        return node
-
-    async def heartbeat(self, node_id: str) -> Node | None:
-        """节点心跳：刷新 heartbeat_time 并派生状态。"""
-        node = await self.get_by_id(node_id)
-        if node is None:
-            return None
-        node.heartbeat_time = datetime.now()
-        node.compute_state(app_config.NODE_HEARTBEAT_GRACE_PERIOD)
         await self.session.flush()
         return node
 

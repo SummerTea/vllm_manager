@@ -215,22 +215,6 @@ def test_render_docker_command_quoted_value_roundtrip(tmp_path):
     assert str(model_dir) in cmd  # 还原为原始含空格路径
 
 
-# ---------- 防漂移：worker 与 server 默认模板一致 ----------
-
-
-def test_default_template_matches_server():
-    """worker 内置 DEFAULT_VLLM_RUN_TEMPLATE 与 server 端逐字符一致（防漂移回归锁定）。
-
-    跨域 import 是**有意的**：漂移检测需要双方实值比对；测试级引用不破坏 worker
-    运行时隔离（worker 运行不 import server 域，仅此测试做一致性格栅锁）。
-    """
-    from app.server.instance.service.start_template import (
-        DEFAULT_VLLM_RUN_TEMPLATE as server_tpl,
-    )
-
-    assert server_tpl == DEFAULT_VLLM_RUN_TEMPLATE
-
-
 # ---------- stop_container ----------
 
 

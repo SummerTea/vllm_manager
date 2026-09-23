@@ -3,7 +3,7 @@
 启动流程（lifespan）：
 1. 构造 ServerClient 并向 server 注册（失败则启动失败退出）
 2. 构造 InstanceLifecycleManager + restore running 实例
-3. 启动后台任务：heartbeat_loop / status_loop / report_loop（实例对账）/
+3. 启动后台任务：status_loop（采集上报，承担存活语义）/ report_loop（实例对账）/
    sync_loop（生命周期权威判定）
 4. yield 后取消全部任务并关闭 http client / lifecycle
 
@@ -32,20 +32,6 @@ from app.worker.lifecycle import InstanceLifecycleManager
 from app.worker.server_client import ServerClient
 
 logger = logging.getLogger(__name__)
-
-
-async def heartbeat_loop(
-    client: ServerClient, node_id: str, token: str, interval: int
-) -> None:
-    """周期心跳（异常不退出；对齐 server prober_loop 风格）。"""
-    while True:
-        try:
-            await client.heartbeat(node_id, token)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("心跳循环异常，进入下一轮")
-        await asyncio.sleep(interval)
 
 
 async def status_loop(
@@ -110,12 +96,7 @@ async def worker_lifespan(app: FastAPI) -> AsyncIterator[None]:
     reg = await client.register()
     app.state.node_id = reg.node_id
     app.state.node_token = reg.token
-    app.state.heartbeat_interval = reg.heartbeat_interval
-    logger.info(
-        "worker 注册成功: node_id=%s, heartbeat_interval=%ss",
-        reg.node_id,
-        reg.heartbeat_interval,
-    )
+    logger.info("worker 注册成功: node_id=%s", reg.node_id)
 
     # 实例生命周期管理 + restore running 实例（stopped 不恢复）
     lifecycle = InstanceLifecycleManager(
@@ -125,10 +106,6 @@ async def worker_lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.lifecycle = lifecycle
 
     tasks = [
-        asyncio.create_task(
-            heartbeat_loop(client, reg.node_id, reg.token, reg.heartbeat_interval),
-            name="worker-heartbeat",
-        ),
         asyncio.create_task(
             status_loop(
                 client,

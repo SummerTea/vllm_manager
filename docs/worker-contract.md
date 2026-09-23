@@ -10,14 +10,14 @@
 
 **worker 角色**：GPU 机器上的管控节点，监听 `:8100`（`WORKER_DEFAULT_PORT`）。**不连 PG、
 不初始化任何扩展**（无 DB/Redis 依赖，无需 `DISABLED_EXTENSIONS`），状态全部保存在
-进程内存中；server 的 PG 是唯一权威账本，worker 心跳/状态上报节点存活与 GPU 状态；
+进程内存中；server 的 PG 是唯一权威账本，worker 状态上报节点存活与 GPU 状态；
 实例状态经 `/instances/report` 独立端点对账。
 
 **依赖**：
 
 | 能力 | 说明 | 对标 |
 |---|---|---|
-| 注册/心跳/状态上报 | worker 启动即向 server 注册，此后按 `heartbeat_interval` 心跳，周期性上报 GPU/系统状态 | `worker_manager` / `collector` |
+| 注册/状态上报 | worker 启动即向 server 注册，此后周期上报 GPU/系统状态（status_loop 15s，承担存活） | `worker_manager` / `collector` |
 | 实例生命周期 | start/stop、健康检查（`/v1/models` 1s 200）、内存状态机、指数退避重启 | `serve_manager.py` |
 | GPU 监控采集 | pynvml 采集 GPU 设备状态（无 GPU/不可用时优雅降级：空列表 + 告警一次，绝不抛异常） | `collector` |
 | 权重统计 | 本地扫描模型目录 `.safetensors/.bin/.pt/.pth` 求和 | `policies/utils.py:get_local_model_weight_size` |
@@ -34,7 +34,7 @@ uvicorn app.worker.main:create_app --factory --host 0.0.0.0
 
 **对账闭环总览**：用户操作（创建/启停）→ server 写 `target_state` + 经
 `request_to_worker` 转发指令 → worker 在 GPU 机上执行（启动/停止/健康检查/退避重启）
-→ worker 心跳/状态上报（实例状态经 `/instances/report` 独立对账）→ server 按对账规则
+→ worker 状态上报（实例状态经 `/instances/report` 独立对账）→ server 按对账规则
 收敛 `state`、达成后清回 `target_state=none`。
 
 ```
@@ -65,7 +65,7 @@ worker ──/instances/report 上报实际 state/port/restart_count──▶ se
 - **鉴权**：公开（无鉴权）。
 - **语义**：节点注册（幂等）。`machine_id` 非空按 `machine_id` 匹配，否则按 `hostname`
   匹配（幂等回退键）。已存在节点：**复用旧 token 不轮换**，刷新可变字段
-  （hostname/ip/advertise_address/worker_port），不写 `heartbeat_time`（liveness 归心跳端点）。
+   （hostname/ip/advertise_address/worker_port），不写 `heartbeat_time`（liveness 归状态上报端点）。
   新节点：`pending` 状态 + 下发新 token（`secrets.token_hex(32)`，DB 列 String(64)）。
   并发重复注册触发 `uix_node_machine_id` 唯一索引时回滚后按原幂等键重查返回已存在节点。
 
@@ -86,19 +86,18 @@ worker ──/instances/report 上报实际 state/port/restart_count──▶ se
 | `node_id` | string | 节点 ID（UUID7） |
 | `token` | string | Bearer 鉴权令牌（重注册返回原 token，不轮换） |
 | `worker_port` | int | worker 端口 |
-| `heartbeat_interval` | int | 建议心跳间隔（秒，= `NODE_HEARTBEAT_INTERVAL`=10） |
 
-### 1.2 `POST /vllm_manager/api/v1/nodes/{node_id}/heartbeat`
+> **部署注记（lockstep）**：本契约端点/字段按**同步升级**管理——删字段（如
+> `heartbeat_interval`，A3 精简）后，**旧版 worker 对新版 server 注册会因响应缺字段
+> 校验失败、新版 worker 对旧版 server 亦同**；升级须 server/worker 同批次发布，
+> 无版本漂移策略。
+
+### 1.2 `POST /vllm_manager/api/v1/nodes/{node_id}/status`
 
 - **鉴权**：Bearer（`get_current_node`：按 token 查节点 + `secrets.compare_digest`
   恒时比对；`current_node.id != node_id` 抛 403 Forbidden）。
-- **语义**：空 body；刷新 `heartbeat_time` 并派生节点状态（心跳超时→offline）。
-- **响应**：`BaseResponse{code=0, message="success", data=null}`。
-
-### 1.3 `POST /vllm_manager/api/v1/nodes/{node_id}/status`
-
-- **鉴权**：Bearer（同 1.2，token 需匹配 `node_id`）。
-- **语义**：全量节点状态上报，落 `system_reserved`/`status` 字段并刷新心跳与状态。
+- **语义**：全量节点状态上报，落 `system_reserved`/`status` 字段并刷新存活时间
+  （`heartbeat_time`）与状态。
   **GPU 显存单位统一 Bytes**（展示层负责换算 GiB）。
 
 **请求体**（`NodeStatusReportRequest`）：
@@ -150,7 +149,7 @@ worker ──/instances/report 上报实际 state/port/restart_count──▶ se
 
 - **响应**：`BaseResponse{code=0, message="success", data=null}`。
 
-### 1.4 `POST /vllm_manager/api/v1/instances/report`
+### 1.3 `POST /vllm_manager/api/v1/instances/report`
 
 - **鉴权**：Bearer（worker 节点 token，`get_current_node`；**仅处理本节点实例**，
   `inst.node_id != node_id` 的条目跳过）。
@@ -246,7 +245,7 @@ worker ──/instances/report 上报实际 state/port/restart_count──▶ se
 | `spec.args` | array | 否 | vLLM 启动附加参数（`list[str]`，用户参数优先） |
 | `gpu_indexes` | array | 是 | 分配的 GPU 索引列表（`list[int]`） |
 | `vram_claim` | int | 是 | 显存需求（Bytes） |
-| `template` | string | 否 | docker 启动模板（含 `{var}` 占位，create 时快照；worker 渲染 port/model_path/gpu_indexes 后 docker run；缺省时 worker 用内置默认模板兜底（存量实例 template 为空）；**模板管理端点 `is_active` 仅影响默认选择——显式指定 template_key 即使停用也可解析**） |
+| `template` | string | 是 | docker 启动模板（含 `{var}` 占位）；**create 直落 server 内置 `DEFAULT_VLLM_RUN_TEMPLATE` 常量快照**（`creation.py`，无模板表/CRUD/template_key）；worker 渲染 port/model_path/gpu_indexes 后 docker run；存量实例（template 为空）由 worker 用内置默认模板兜底 |
 
 **模板变量占位符表**（`template` 内可用的占位符，worker 渲染时替换）：
 
@@ -263,16 +262,16 @@ worker ──/instances/report 上报实际 state/port/restart_count──▶ se
 | `{env_args}` | 环境变量片段 | `-e` 注入（OMP_NUM_THREADS / SAFETENSORS_FAST_GPU / VLLM_CACHE_ROOT） |
 | `{mount_args}` | 挂载片段 | `-v` 注入（模型根 + 缓存同路径） |
 
-> **防漂移注记**：server 端 `DEFAULT_VLLM_RUN_TEMPLATE` 常量与 worker 内置默认模板
-> **须保持一致**（server 表内无默认模板时回退该常量下发）。Phase B 落 worker 侧
-> docker 渲染后核对两边字符串，后续改动须同步（防漂移测试
-> `test_default_template_matches_server` 回归锁定）。
+> **防漂移注记**：server 端 `DEFAULT_VLLM_RUN_TEMPLATE` 常量（`creation.py`）与
+> worker 内置默认模板**须保持一致**——create 直落该常量快照下发（无模板表兜底
+> 路径）。Phase B 落 worker 侧 docker 渲染后核对两边字符串，后续改动须同步
+> （防漂移测试 `test_default_template_matches_worker` 回归锁定）。
 
-> **信任边界（S11）**：模板为**管理员维护的受信配置**（server 模板表 CRUD + start
-> 快照下发），**非用户输入**——用户只填 `spec` 字段（model_name/task/args 等），
+> **信任边界（S11）**：模板为**内置常量快照**（server 端 `DEFAULT_VLLM_RUN_TEMPLATE`
+> 常量直落下发），**非用户输入**——用户只填 `spec` 字段（model_name/task/args 等），
 > 不直接触碰模板；server↔worker 双向 Bearer 鉴权保护下发链路。模板含 docker 任意
-> flag 能力（如 `--privileged`/`-v` 任意路径），部署方须控制模板表写权限；worker
-> 渲染仅做 `shlex` 安全切词（防注入），不对模板内容做白名单约束。
+> flag 能力（如 `--privileged`/`-v` 任意路径），改动需代码评审同步 server/worker
+> 两侧常量；worker 渲染仅做 `shlex` 安全切词（防注入），不对模板内容做白名单约束。
 
 > **模板约束（S1）**：**禁用 `-d`/`--detach`**——worker 以 docker CLI 进程存活判定容器
 > 存活（快速失败逻辑依赖前台 attach：CLI 退出 = 容器结束）；detach 后 CLI 立即退出会
@@ -397,7 +396,7 @@ Phase B 容器化后走 docker run 模板渲染）：
   （server 端 `apply_report` 仅上报非 None 时更新 port）。
 - **与 server 对账联动**：worker 无主动拉取，只上报；server 侧节点失联时对
   `running` 实例置 `unreachable`（不删除，人工介入），恢复后对账拉回；
-  `target=stopping` 但上报仍非 stopped → server 限次重下发 stop（见 §1.4 规则 3）。
+  `target=stopping` 但上报仍非 stopped → server 限次重下发 stop（见 §1.3 规则 3）。
 
 ## 4. 鉴权与错误处理
 
@@ -425,19 +424,16 @@ Phase B 容器化后走 docker run 模板渲染）：
 | 配置 | 默认值 | 说明 | worker 实现是否需要 |
 |---|---|---|---|
 | `WORKER_DEFAULT_PORT` | 8100 | worker 默认监听端口（注册可覆盖） | 是（默认端口） |
-| `NODE_HEARTBEAT_INTERVAL` | 10s | 建议心跳间隔，注册时下发 | **是（心跳周期）** |
-| `NODE_HEARTBEAT_GRACE_PERIOD` | 30s | server 心跳超时阈值（→ offline） | 否（server 侧判定） |
+| `NODE_HEARTBEAT_GRACE_PERIOD` | 30s | server 存活超时阈值（→ offline） | 否（server 侧判定） |
 | `NODE_PROBE_INTERVAL` | 15s | server 主动 `/healthz` 探测周期 | 否（server 侧任务） |
 | `NODE_PROBE_TIMEOUT` | 3s | `/healthz` 探测超时 | 否（server 侧任务） |
 | `INSTANCE_REQUEST_TIMEOUT` | 15s | server→worker 指令转发超时 | 否（server 侧转发） |
 | `INSTANCE_WEIGHT_TIMEOUT` | 15s | 权重广播查询超时 | 否（server 侧转发） |
-| `INSTANCE_RECONCILE_INTERVAL` | 15s | 实例失联对账周期（server 后台） | 否（server 侧任务） |
 | `INSTANCE_DEFAULT_GMU` | 0.9 | 实例默认显存利用率 GMU（0-1） | **是（缺省补 GMU 参数）** |
 | `WORKER_VLLM_IMAGE` | `vllm/vllm-openai:latest` | vLLM 容器镜像（渲染 `{image}`） | **是（docker run 镜像）** |
 | `WORKER_VLLM_SHM_SIZE_GIB` | 10.0 | 共享内存 GiB（渲染 `--shm-size {shm_size}`，vLLM 大模型加载需要） | **是（渲染 {shm_size}）** |
 
-worker 实现时需要感知：`WORKER_DEFAULT_PORT`（默认监听端口）、
-`NODE_HEARTBEAT_INTERVAL`（心跳节奏，注册响应下发）、`INSTANCE_DEFAULT_GMU`
+worker 实现时需要感知：`WORKER_DEFAULT_PORT`（默认监听端口）、`INSTANCE_DEFAULT_GMU`
 （启动参数组装缺省 GMU）、`WORKER_VLLM_IMAGE`（容器镜像）、`WORKER_VLLM_SHM_SIZE_GIB`
 （共享内存）、`WORKER_VLLM_BIN`（**容器内 vLLM 命令**，支持多词形式如
 `python -m vllm.entrypoints.openai.api_server`——worker 渲染 `{vllm_bin}` 时
@@ -457,7 +453,7 @@ worker 实现时需要感知：`WORKER_DEFAULT_PORT`（默认监听端口）、
 | 停止悬挂收敛 | server `apply_report`：`target=stopping` 且上报非 stopped → 限次重下发 stop（`target_retry_count` ≤3，超限 `state_message` 告警、保持 target 不自动收敛）；start/stop 重置计数 | `service/instance.py:apply_report`、`base.py:InstanceLifecycleMixin.target_retry_count` |
 | 转发错误码透传 | server 全局 handler 透传 worker 非 2xx 的 `status_code`（401/403→502 防前端误判）；start/create 转发处先 `except HttpClientException: raise` 再包装传输错误 | `main/exceptions.py:http_client_exception_handler`、`service/instance.py:start`、`service/creation.py` |
 | restore 端口策略 | meta json（port/gpu_indexes/spec/model_path）+ `docker inspect`（State.Status==running）判定，**仅恢复 running** 复用原端口；探针异常保留 meta + 告警，容器不存在/非 running 删 meta | `lifecycle.py:restore` |
-| 模板快照 | start 指令 `StartRequest.template`（server `_build_start_payload` 顶层下发）→ worker 存入 `spec["template"]` 随 meta 持久化；退避重启/restore 复用同一模板；缺省用内置默认模板兜底（存量实例） | `lifecycle.py:start`/`_launch_container` |
+| 模板快照 | start 指令 `StartRequest.template`（server `_build_start_payload` 顶层下发）→ worker 存入 `spec["template"]` 随 meta 持久化；退避重启/restore 复用同一模板；**create 直落 server 内置 `DEFAULT_VLLM_RUN_TEMPLATE` 常量快照（`creation.py`，无模板表/CRUD/template_key）**，存量实例缺省用 worker 内置默认模板兜底 | `service/creation.py`、`lifecycle.py:start`/`_launch_container` |
 | 退避重启 | 首次 delay=0，之后 `min(10·2^(n-1), 300)`；拒启类（retryable=False）不自动重启；docker CLI 缺失（FileNotFoundError）→ retryable=False 永久化；**拉起前入口无条件 stop_container 清理同名残留容器**（防 Exited 残留 → 同名 docker run 冲突死循环，同时覆盖原 pre-kill） | `lifecycle.py:_maybe_restart`/`_launch_container` |
 
 ### 真待定（worker 实现时细化）
