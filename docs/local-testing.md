@@ -199,30 +199,34 @@ worker 侧已有两处正确降级（无需改）：`_check_vram`（pynvml 不�
    | `SERVER_URL` | `http://127.0.0.1:8000` | 指向本机 server |
    | `WORKER_LISTEN_PORT` | `8100`（默认） | 按本机实际端口 |
 
-3. **create 请求示例**（`POST /vllm_manager/api/v1/instances`）：
+3. **create 请求示例**（`POST /vllm_manager/api/v1/instances`，**实测跑通参数**）：
 
     ```json
     {
       "model_name": "Qwen3-0.6B",
       "args": [
-        "--enforce-eager", "--dtype", "float32", "--max-model-len", "4096",
-        "--gpu-memory-utilization", "0.5"
+        "--enforce-eager", "--dtype", "float32", "--max-model-len", "2048",
+        "--gpu-memory-utilization", "0.65"
       ]
     }
     ```
 
    （§4 关键参数经 `args` 透传；`tensor_parallel_size` 保持 1——CPU 分支 tp>1 拒绝。）
 
-> **CPU 内存预算（P1-2）**：CPU 后端把 `--gpu-memory-utilization`（GMU）解释为
-> **CPU 内存保留比例**（非显存）——默认 0.9 × 本机 7.74GiB ≈ 6.96GiB > 启动时可用
-> ~5.74GiB，vLLM 会在 KV cache 分配前拒绝启动。**CPU 场景必须经 args 显式调低**
-> （本机实测 0.5 可推进到 KV cache 分配阶段）。GPU 场景不受影响（GMU 仍按显存语义）。
->
-> **运行内存硬约束（冒烟实测）**：colima VM 总内存 **7.74GiB 不足以跑通
-> Qwen3-0.6B/float32 全链路**——权重加载后可用仅 ~2.19GiB，GMU 0.5 的 KV 预算
-> 3.87GiB 确定性超预算。**需 colima 扩容 ≥16GiB**（`colima stop && colima start
-> --memory 16`）或换更小模型/`--dtype bfloat16` 不可行（arm64 oneDNN 缺陷，见 §4 坑 5）
-> ——或继续降 GMU（余量极小，不建议）。
+> **CPU 内存预算（P1-2，第四轮实测定稿）**：CPU 后端把 `--gpu-memory-utilization`
+> （GMU）解释为 **CPU 内存保留比例**（非显存），且 KV cache 校验公式为
+> **`KV空间 = gmu×total − 进程RSS`**（vLLM v0.30 `cpu_worker.determine_available_memory`
+> 源码实证；RSS 为权重+引擎常驻，Qwen3-0.6B/float32 ≈ 4.1~4.3GiB）。
+> 由此：**正确方向是升 GMU 而非降**——GMU 0.3/0.5 时 `KV空间` 被固定 RSS 反超为负而
+> 拒绝启动；**可行窗口 GMU ∈ (0.53, 0.80)**（8GiB colima 实测 0.65 通过，0.6 差
+> ~70MiB）。`--max-model-len 2048` 把 KV 需求压到 ~0.44GiB（4096 需更大）。
+> GPU 场景不受影响（GMU 仍按显存语义，worker 侧只透传不解释）。
+
+> **运行内存实测（第四轮，8GiB 零扩容跑通）**：colima **8GiB 足以跑通
+> Qwen3-0.6B/float32 全链路**（GMU 0.65 + max-len 2048）：create → running（~45s）→
+> /v1/models 200 → 推理成功 → stop → stopped 自动收敛（~10s）。无需扩容 16GiB。
+> 若换更大模型需上调 GMU 或扩容（`colima stop && colima start --memory N`，
+> N 依模型；colima stop 后内存归还本机）。
 
 > **A1 注记（模板依赖镜像 ENTRYPOINT）**：默认模板不再含 `{vllm_bin} serve`——
 > `vllm serve` 由官方镜像 `ENTRYPOINT=["vllm","serve"]` 承担（旧模板叠加会实执行
