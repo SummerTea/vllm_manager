@@ -97,6 +97,7 @@ async def test_update_status_persists_json(session):
                     utilization_rate=12.5,
                 )
             ],
+            accelerator="gpu",
         ),
     )
     updated = await svc.update_status(node.id, report)
@@ -107,6 +108,7 @@ async def test_update_status_persists_json(session):
     assert updated.system_reserved["ram"] == 8 * 1024**3
     assert updated.status["gpu_devices"][0]["name"] == "RTX 4090"
     assert updated.status["memory"]["used"] == 10 * 1024**3
+    assert updated.status["accelerator"] == "gpu"  # 显式字段经 model_dump 全量落库保留
     assert updated.heartbeat_time is not None
     assert updated.state == NodeStateEnum.READY.value
     # node 级 state_message 由 compute_state 独占（心跳新鲜且非 unreachable → 无 message）

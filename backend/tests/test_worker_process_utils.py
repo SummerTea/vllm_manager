@@ -175,8 +175,13 @@ def test_quote_arg_and_join_fragment():
     assert joined == "--port 18080 --served-model-name 'qwen 2.5'"
 
 
-def _render_cmd(tmp_path: Path) -> list[str]:
-    """按 lifecycle._launch_container 同构组装默认模板渲染结果。"""
+def _render_cmd_with(
+    tmp_path: Path,
+    gpu_indexes: str,
+    net_args: str,
+    gpus_args: str,
+) -> list[str]:
+    """按 lifecycle._launch_container 同构组装默认模板渲染结果（可指定网络/GPU 片段）。"""
     model_dir = tmp_path / "models" / "qwen2.5"
     model_dir.mkdir(parents=True)
     spec = _spec()
@@ -192,13 +197,112 @@ def _render_cmd(tmp_path: Path) -> list[str]:
         vllm_bin="vllm",
         model_path=str(model_dir),
         port="18080",
-        gpu_indexes="0,1",
+        gpu_indexes=gpu_indexes,
+        net_args=net_args,
+        gpus_args=gpus_args,
         shm_size="10g",
         args_fragment=args_frag,
         env_args=env_args,
         mount_args=mount_args,
     )
     return render_docker_command(DEFAULT_VLLM_RUN_TEMPLATE, ctx)
+
+
+def _render_cmd(tmp_path: Path) -> list[str]:
+    """按 lifecycle._launch_container 同构组装默认模板渲染结果（GPU 路径）。"""
+    return _render_cmd_with(tmp_path, "0,1", "--network host", "--gpus device=0,1")
+
+
+# ---------- 结构性网络/GPU 差异片段 ----------
+
+
+def test_build_context_net_gpu_fragments():
+    """build_context 派生片段透传：GPU（gpu_indexes 非空串）与 CPU（空串）两路。"""
+    ctx = build_context(
+        name="vllm-i-1",
+        image="img",
+        vllm_bin="vllm",
+        model_path="/m/q",
+        port="18080",
+        gpu_indexes="0,1",
+        net_args="--network host",
+        gpus_args="--gpus device=0,1",
+        shm_size="10g",
+        args_fragment="",
+        env_args="",
+        mount_args="",
+    )
+    assert ctx["net_args"] == "--network host"
+    assert ctx["gpus_args"] == "--gpus device=0,1"
+
+    ctx_cpu = build_context(
+        name="vllm-i-1",
+        image="img",
+        vllm_bin="vllm",
+        model_path="/m/q",
+        port="18080",
+        gpu_indexes="",
+        net_args="-p 18080:18080",
+        gpus_args="",
+        shm_size="10g",
+        args_fragment="",
+        env_args="",
+        mount_args="",
+    )
+    assert ctx_cpu["net_args"] == "-p 18080:18080"
+    assert ctx_cpu["gpus_args"] == ""
+
+
+def test_render_docker_command_gpu_fragments(tmp_path):
+    """GPU 渲染：含 --network host 与 --gpus device=，与现行为 token 等价。"""
+    cmd = _render_cmd_with(tmp_path, "0,1", "--network host", "--gpus device=0,1")
+    assert cmd[cmd.index("--network") + 1] == "host"
+    assert cmd[cmd.index("--gpus") + 1] == "device=0,1"
+
+
+def test_render_docker_command_cpu_fragments(tmp_path):
+    """CPU 渲染：含 -p {port}:{port}，不含 --network/--gpus（空串片段）。"""
+    cmd = _render_cmd_with(tmp_path, "", "-p 18080:18080", "")
+    assert "-p" in cmd and "18080:18080" in cmd
+    assert "--network" not in cmd
+    assert "--gpus" not in cmd
+
+
+def test_render_old_format_template_no_keyerror(tmp_path):
+    """Gate 1 P1-1 防回归：存量旧格式模板（无 {net_args}/{gpus_args} 占位符）
+    用当前 build_context（含旧键 gpu_indexes/port）渲染不抛 KeyError。
+
+    存量实例的 template 快照是引入结构性片段前的旧模板
+    （`--network host --gpus device={gpu_indexes}`），新 build_context 必须保留
+    旧键（gpu_indexes/port）使其可继续渲染——否则 worker 重启/退避拉起存量实例
+    会 KeyError → ERROR。
+    """
+    old_template = (
+        "docker run --name {name} --network host --shm-size {shm_size} "
+        "--gpus device={gpu_indexes} {mount_args} {env_args} {image} "
+        "{vllm_bin} serve {model_path} {args}"
+    )
+    model_dir = tmp_path / "models" / "qwen2.5"
+    model_dir.mkdir(parents=True)
+    spec = _spec()
+    full = build_vllm_command("vllm", model_dir, spec, 18080, 0.9)
+    ctx = build_context(
+        name="vllm-i-1",
+        image="vllm/vllm-openai:latest",
+        vllm_bin="vllm",
+        model_path=str(model_dir),
+        port="18080",
+        gpu_indexes="0,1",
+        net_args="--network host",
+        gpus_args="--gpus device=0,1",
+        shm_size="10g",
+        args_fragment=join_arg_fragment(full[3:]),
+        env_args="",
+        mount_args="",
+    )
+    cmd = render_docker_command(old_template, ctx)  # 不抛 KeyError
+    assert cmd[cmd.index("--gpus") + 1] == "device=0,1"
+    assert cmd[cmd.index("--network") + 1] == "host"
 
 
 # ---------- docker 模板渲染 ----------
@@ -241,6 +345,8 @@ def test_render_docker_command_quoted_value_roundtrip(tmp_path):
         model_path=str(model_dir),
         port="18080",
         gpu_indexes="0",
+        net_args="--network host",
+        gpus_args="--gpus device=0",
         shm_size="10g",
         args_fragment="",
         env_args="",
@@ -450,6 +556,8 @@ def test_render_args_with_braces_ok(tmp_path):
         model_path=str(model_dir),
         port="18080",
         gpu_indexes="0",
+        net_args="--network host",
+        gpus_args="--gpus device=0",
         shm_size="10g",
         args_fragment=args_fragment,
         env_args="",
@@ -510,6 +618,8 @@ def test_render_multi_word_vllm_bin(tmp_path):
         model_path=str(model_dir),
         port="18080",
         gpu_indexes="0",
+        net_args="--network host",
+        gpus_args="--gpus device=0",
         shm_size="10g",
         args_fragment="--port 18080",
         env_args="",

@@ -123,6 +123,7 @@ worker ──/instances/report 上报实际 state/port/restart_count──▶ se
 | `swap` | object | 否 | 交换分区状态 |
 | `swap.total` | int | 否 | 交换分区总量（Bytes） |
 | `swap.used` | int | 否 | 已用交换分区（Bytes） |
+| `accelerator` | string | 否 | 加速器类型（`gpu`/`cpu`，worker `WORKER_ACCELERATOR` 配置值）；server 据此判定 CPU 分配，**缺省/未知 → fail-closed 按 GPU 处理** |
 | `gpu_devices` | array | 否 | GPU 设备列表（无 GPU 时传空数组） |
 | `gpu_devices[]` | object | 否 | 单卡状态（见下表） |
 | `filesystem` | array | 否 | 文件系统状态 `list[dict]` |
@@ -256,10 +257,12 @@ worker ──/instances/report 上报实际 state/port/restart_count──▶ se
 | `{vllm_bin}` | 容器内命令 | 如 `python -m vllm.entrypoints.openai.api_server`（按 worker 实现） |
 | `{model_path}` | 模型路径 | `resolve_model_path` 解析后的路径 |
 | `{port}` | 服务端口 | worker 分配的端口 |
-| `{gpu_indexes}` | GPU 索引 | 逗号分隔字符串（`--gpus device=` / `NVIDIA_VISIBLE_DEVICES` 共用） |
+| `{gpu_indexes}` | GPU 索引 | 逗号分隔字符串；**存量模板兼容保留**（默认模板经 `{gpus_args}` 使用，不再直接拼 `--gpus device=`） |
+| `{net_args}` | 结构性网络片段 | 按 `gpu_indexes` 是否为空派生：GPU → `--network host`；CPU → `-p {port}:{port}`（colima 端口映射，宿主机 `127.0.0.1:{port}` 可达） |
+| `{gpus_args}` | 结构性 GPU 片段 | GPU → `--gpus device={gpu_indexes}`；CPU → 空串 |
 | `{shm_size}` | 共享内存 | `WORKER_VLLM_SHM_SIZE_GIB` + `g`（如 `16g`） |
 | `{args}` | vLLM serve 参数片段 | `--task` 映射 / 缺省补全后的启动参数 |
-| `{env_args}` | 环境变量片段 | `-e` 注入（OMP_NUM_THREADS / SAFETENSORS_FAST_GPU / VLLM_CACHE_ROOT） |
+| `{env_args}` | 环境变量片段 | `-e` 注入（OMP_NUM_THREADS / SAFETENSORS_FAST_GPU / VLLM_CACHE_ROOT；OMP/SAFETENSORS 仅 GPU 实例注入） |
 | `{mount_args}` | 挂载片段 | `-v` 注入（模型根 + 缓存同路径） |
 
 > **防漂移注记**：server 端 `DEFAULT_VLLM_RUN_TEMPLATE` 常量（`creation.py`）与
@@ -277,6 +280,22 @@ worker ──/instances/report 上报实际 state/port/restart_count──▶ se
 > 存活（快速失败逻辑依赖前台 attach：CLI 退出 = 容器结束）；detach 后 CLI 立即退出会
 > 被误判 error，且容器脱离 worker 管控。同理避免 `--restart` 系列（容器自重启绕过
 > worker 退避计数与对账）。
+
+**CPU 模式（显式加速器声明）**：
+
+- `accelerator=cpu` 节点（worker `WORKER_ACCELERATOR=cpu` 上报）→ allocator 分配
+  `gpu_indexes=[]`、`allocated_vram={}`（tp>1 拒绝）；**GPU / 未声明 / `gpu_devices`
+  为空一律 fail-closed 拒绝**——不按空 `gpu_devices` 推断 CPU（GPU 节点采集降级也会
+  上报空列表，推断会 fail-open 误分配）。
+- worker 渲染：`gpu_indexes` 为空 → `{net_args}="-p {port}:{port}"`（colima 下宿主机
+  `127.0.0.1:{port}` 可达）、`{gpus_args}=""`（无 `--gpus`）；健康检查不变
+  （`GET /v1/models` 1s 200）。
+- **CPU 启动参数**（`--enforce-eager --dtype float32 --max-model-len 4096`）**经用户
+  `args` 透传**，模板不内置（arm64 CPU 实测必要参数：跳过 torch.compile、避开 bf16
+  oneDNN 卡死、控制 KV cache 内存，见 `docs/local-testing.md` §4）。
+- **镜像需 CPU 版**（`WORKER_VLLM_IMAGE`，如 `vllm/vllm-openai-cpu:latest-arm64`）；
+  CPU 实例**不注入** `OMP_NUM_THREADS=1`/`SAFETENSORS_FAST_GPU=1`（注入会把推理锁单
+  线程，性能极差；GPU 行为不变）。
 
 **task → `--task` 映射表**（产品层分类 → vLLM 实际枚举）：
 
@@ -300,19 +319,23 @@ Phase B 容器化后走 docker run 模板渲染）：
    `--served-model-name`（= `model_name`）、`--gpu-memory-utilization`（缺省补 GMU）；
    `tensor_parallel_size > 1` 补 `--tensor-parallel-size`（参考
    `vllm.py:extend_args_no_exist` + `get_auto_parallelism_arguments`）。
-   **GPU 透传**：经模板 `{gpu_indexes}` 渲染为 `--gpus device={gpu_indexes}`（默认模板）
-   ——容器内 CUDA 索引 = 宿主索引，**不再注入 `CUDA_VISIBLE_DEVICES`**（渲染值见下方占位符表）。
+   **GPU 透传**：经模板 `{gpus_args}` 渲染为 `--gpus device={gpu_indexes}`（GPU 节点；
+   CPU 节点该片段为空串）——容器内 CUDA 索引 = 宿主索引，**不再注入
+   `CUDA_VISIBLE_DEVICES`**（渲染值见上方占位符表）。
 4. **env 注入**：`OMP_NUM_THREADS=1`、`SAFETENSORS_FAST_GPU=1`、
    `VLLM_CACHE_ROOT`（worker 持久目录）——经模板 `{env_args}` 占位渲染为 `-e` 参数
    （参考 `vllm.py:_get_configured_env`）。
 5. **Popen(docker run, 无 shell)**：`template.format_map(context)` 渲染 → `shlex.split`
    切 argv（**list 直传 Popen，不经 shell**）；docker run 前台 + `stdout` 重定向实例日志；
    模板缺省（template=None，含存量实例）用 worker 内置默认模板兜底。
-6. **健康检查**：`GET /v1/models` 单次 1s 超时 200 → `running`（**`--network host`
-   下 `127.0.0.1:{port}` 直连容器**）；docker CLI 已退出（`poll() != None`，容器必然
+6. **健康检查**：`GET /v1/models` 单次 1s 超时 200 → `running`（**GPU host 网络 /
+   CPU `-p` 端口映射均以 `127.0.0.1:{port}` 直连容器**——CPU 模式 colima 端口映射后
+   宿主机可达）；docker CLI 已退出（`poll() != None`，容器必然
    结束——镜像缺失/拉取失败等立即退出）→ 直接落 `error` + 退出码诊断；starting 超时
-   （连续失败 N 次，默认 N=2，5s sync 周期 ×2 ≈10s；或总时长超 30s）→ `error`
-   （参考 `serve_manager.py:is_ready`；总预算默认值同 §3）。
+   （连续失败 ≥`WORKER_STARTUP_FAIL_THRESHOLD` 次，默认 2，5s sync 周期 ×2 ≈10s；
+   或总时长超 `WORKER_STARTUP_TIMEOUT_SECONDS`，默认 30s；**CPU 模型加载 30-60s
+   需调大，本机实测 12 / 90**）→ `error`
+   （参考 `serve_manager.py:is_ready`；阈值默认值同 §3）。
 7. **启动失败**：try/except 显式落 `error` + `state_message`（可读原因；docker CLI 缺失/
    Popen 即抛 → `retryable=False` 永久性错误；参考
    `serve_manager.py:_start_model_instance` except 分支写 ERROR + state_message）。
@@ -375,11 +398,12 @@ Phase B 容器化后走 docker run 模板渲染）：
   （防 docker 短暂不可用时误删 meta → 实例被对账 stopped → 显存超卖）；容器不存在/
   Exited/dead → 删 meta（不恢复）。
 - **健康检查**：进程存活（docker CLI pid）&& `GET /v1/models` 200（单次 1s 超时）→
-  `running`（host 网络下 `127.0.0.1:{port}` 直连容器）；docker CLI 已退出 → 容器必然
-  结束，直接判 error；**starting 超时总预算**：连续健康检查失败 N 次（默认 N=2，
-  5s sync 周期 ×2 ≈10s 快速失败）或自启动起总时长超 30s（兜底，模型加载超长时）
-  判 `error`（默认值 worker 实现可调，需 ≥ 模型加载通常耗时）
-  （参考 `serve_manager.py:is_ready`）。
+  `running`（GPU host 网络 / CPU `-p` 端口映射均 `127.0.0.1:{port}` 直连容器）；
+  docker CLI 已退出 → 容器必然结束，直接判 error；**starting 超时总预算**：连续健康
+  检查失败 ≥`WORKER_STARTUP_FAIL_THRESHOLD` 次（默认 2，5s sync 周期 ×2 ≈10s 快速
+  失败）或自启动起总时长超 `WORKER_STARTUP_TIMEOUT_SECONDS`（默认 30s，兜底模型加载
+  超长时）判 `error`（**CPU 模型加载 30-60s 需调大，本机实测 12 / 90**；默认值需 ≥
+  模型加载通常耗时）（参考 `serve_manager.py:is_ready`）。
 - **指数退避重启**：**首次失败立即重试（delay=0）**，之后
   `delay = min(10·2^(n-1), 300s)`（n 为已退避次数，封顶 300s），`restart_count` 随上报
   递增（server 记录）；error 且允许重启 → 延迟后置回 `starting`
@@ -432,6 +456,9 @@ Phase B 容器化后走 docker run 模板渲染）：
 | `INSTANCE_DEFAULT_GMU` | 0.9 | 实例默认显存利用率 GMU（0-1） | **是（缺省补 GMU 参数）** |
 | `WORKER_VLLM_IMAGE` | `vllm/vllm-openai:latest` | vLLM 容器镜像（渲染 `{image}`） | **是（docker run 镜像）** |
 | `WORKER_VLLM_SHM_SIZE_GIB` | 10.0 | 共享内存 GiB（渲染 `--shm-size {shm_size}`，vLLM 大模型加载需要） | **是（渲染 {shm_size}）** |
+| `WORKER_ACCELERATOR` | `gpu` | 加速器类型（`gpu`/`cpu`）；`cpu` 为 CPU 集成测试显式声明，默认 `gpu` 保持 GPU 主战场 fail-closed | **是（status 载荷上报 `accelerator`）** |
+| `WORKER_STARTUP_FAIL_THRESHOLD` | 2 | starting 连续健康检查失败阈值（5s sync 周期 ×N ≈ 快速失败） | **是（starting 判 error）** |
+| `WORKER_STARTUP_TIMEOUT_SECONDS` | 30 | starting 总预算秒数（模型加载超长兜底；CPU 需调大，实测 90） | **是（starting 判 error）** |
 
 worker 实现时需要感知：`WORKER_DEFAULT_PORT`（默认监听端口）、`INSTANCE_DEFAULT_GMU`
 （启动参数组装缺省 GMU）、`WORKER_VLLM_IMAGE`（容器镜像）、`WORKER_VLLM_SHM_SIZE_GIB`
@@ -448,12 +475,16 @@ worker 实现时需要感知：`WORKER_DEFAULT_PORT`（默认监听端口）、`
 | start 重复下发幂等 | **200 幂等**（已存在 record 直接返回 accepted，不重建） | `lifecycle.py:start` |
 | stopping 过渡期上报 | worker 内存态有 STOPPING 但 `snapshot_for_report` 跳过；stop 完成清内存记录 → report 消失 → server 收敛 stopped | `lifecycle.py:snapshot_for_report` / `stop` |
 | GPU 优雅降级 | pynvml 不可用/无 GPU → 空 `gpu_devices` + 告警一次，绝不抛异常 | `collector.py:_collect_gpu_devices` |
-| docker 启动渲染 | 模板 `format_map` → `shlex.split` → argv 直传 Popen（**无 shell**）；`{args}`/`{env_args}`/`{mount_args}` 片段经 shlex.join 预 quote；用户可控占位值经 shlex.quote 防御 | `process_utils.py:render_docker_command`/`build_context` |
+| docker 启动渲染 | 模板 `format_map` → `shlex.split` → argv 直传 Popen（**无 shell**）；`{args}`/`{env_args}`/`{mount_args}` 片段经 shlex.join 预 quote；用户可控占位值经 shlex.quote 防御；`{net_args}`/`{gpus_args}` 为结构性差异片段（按 `gpu_indexes` 派生，见下） | `process_utils.py:render_docker_command`/`build_context` |
 | 容器停止 | `docker stop -t 3` → 超时/失败 `docker kill` → `docker rm`；**绝不 killpg docker CLI**（杀 CLI 不杀容器致孤儿）；stop/rm 对不存在容器容错；`stop_container` 返回 `bool`，docker 命令不可用（停止结果未知）→ `stop()` 恢复调用前状态、保留记录/meta、返回 500 不谎报停止（server 对账重下发兜底） | `process_utils.py:stop_container` / `lifecycle.py:stop` |
 | 停止悬挂收敛 | server `apply_report`：`target=stopping` 且上报非 stopped → 限次重下发 stop（`target_retry_count` ≤3，超限 `state_message` 告警、保持 target 不自动收敛）；start/stop 重置计数 | `service/instance.py:apply_report`、`base.py:InstanceLifecycleMixin.target_retry_count` |
 | 转发错误码透传 | server 全局 handler 透传 worker 非 2xx 的 `status_code`（401/403→502 防前端误判）；start/create 转发处先 `except HttpClientException: raise` 再包装传输错误 | `main/exceptions.py:http_client_exception_handler`、`service/instance.py:start`、`service/creation.py` |
 | restore 端口策略 | meta json（port/gpu_indexes/spec/model_path）+ `docker inspect`（State.Status==running）判定，**仅恢复 running** 复用原端口；探针异常保留 meta + 告警，容器不存在/非 running 删 meta | `lifecycle.py:restore` |
-| 模板快照 | start 指令 `StartRequest.template`（server `_build_start_payload` 顶层下发）→ worker 存入 `spec["template"]` 随 meta 持久化；退避重启/restore 复用同一模板；**create 直落 server 内置 `DEFAULT_VLLM_RUN_TEMPLATE` 常量快照（`creation.py`，无模板表/CRUD/template_key）**，存量实例缺省用 worker 内置默认模板兜底 | `service/creation.py`、`lifecycle.py:start`/`_launch_container` |
+| 加速器显式声明 | `WORKER_ACCELERATOR`（`gpu`/`cpu`）经 status 载荷 `accelerator` 字段上报（`collector.py`）；server `NodeStatus.accelerator`/`WorkerResource.accelerator` 显式字段，allocator **仅 `accelerator == "cpu"` 走 CPU 分配**（`gpu_indexes=[]`、`allocated_vram={}`、tp>1 拒绝）；GPU/未声明/`gpu_devices` 空 → fail-closed 拒绝 | `collector.py:collect`、`node/schema.py:NodeStatus`、`allocator/schema.py:WorkerResource`、`allocator/service.py:_try_worker`、`service/creation.py` |
+| CPU 模板变体（net_args/gpus_args） | `DEFAULT_VLLM_RUN_TEMPLATE` 含 `{net_args}`/`{gpus_args}` 结构性片段：`gpu_indexes` 非空 → `--network host` + `--gpus device={gpu_indexes}`；空 → `-p {port}:{port}` + 空串（colima 端口映射宿主机可达，健康检查不变）；`{gpu_indexes}`/`{port}` 键仍保留（存量模板快照兼容） | `process_utils.py:build_context`、`lifecycle.py:_launch_container`、`creation.py:DEFAULT_VLLM_RUN_TEMPLATE` |
+| CPU 不注入 OMP/SAFETENSORS | `gpu_indexes` 为空（CPU 实例）**不注入** `OMP_NUM_THREADS=1`/`SAFETENSORS_FAST_GPU=1`（注入会把推理锁单线程，性能极差）；GPU 行为不变；`VLLM_CACHE_ROOT` GPU/CPU 都保留 | `lifecycle.py:_launch_container` |
+| 模板快照 | start 指令 `StartRequest.template`（server `_build_start_payload` 顶层下发）→ worker 存入 `spec["template"]` 随 meta 持久化；退避重启/restore 复用同一模板；**create 直落 server 内置 `DEFAULT_VLLM_RUN_TEMPLATE` 常量快照（`creation.py`，含 `{net_args}`/`{gpus_args}` 结构性片段，无模板表/CRUD/template_key）**，存量实例缺省用 worker 内置默认模板兜底 | `service/creation.py`、`lifecycle.py:start`/`_launch_container` |
+| starting 超时双阈值配置化 | `WORKER_STARTUP_FAIL_THRESHOLD`（默认 2）/`WORKER_STARTUP_TIMEOUT_SECONDS`（默认 30）升配为 `WorkerConfig` 字段；CPU 模型加载 30-60s 需调大（本机实测 12 / 90） | `worker/config.py`、`lifecycle.py:sync` |
 | 退避重启 | 首次 delay=0，之后 `min(10·2^(n-1), 300)`；拒启类（retryable=False）不自动重启；docker CLI 缺失（FileNotFoundError）→ retryable=False 永久化；**拉起前入口无条件 stop_container 清理同名残留容器**（防 Exited 残留 → 同名 docker run 冲突死循环，同时覆盖原 pre-kill） | `lifecycle.py:_maybe_restart`/`_launch_container` |
 
 ### 真待定（worker 实现时细化）
@@ -461,9 +492,6 @@ worker 实现时需要感知：`WORKER_DEFAULT_PORT`（默认监听端口）、`
 - **GPU 上报 dict 细节**：`filesystem`/`os`/`kernel`/`uptime` 已简化实现
   （`collector.py`），结构可按需增补（当前：filesystem=[{name,mount_point,total,used}]、
   os={name,version}、kernel={release,version}、uptime={seconds}）。
-- **starting 超时双阈值可调**：默认连续失败 N=2 ≈10s / 总时长 30s，当前为 worker
-  `lifecycle.py` 模块常量（`_STARTUP_FAIL_THRESHOLD`/`_STARTUP_TIMEOUT_SECONDS`），
-  如需运维可调可升配为 WorkerConfig 字段。
 
 > **升级注意（server 侧 schema）**：`vllm_manager_instance` 表新增 `target_retry_count`
 > 列（P0 整改）。项目无迁移链（`create_all` 仅建新表，sqlite 测试自动建表无影响）；

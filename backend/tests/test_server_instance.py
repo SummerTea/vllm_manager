@@ -106,6 +106,38 @@ async def _ready_node(session, *, machine_id: str = "m-001") -> Node:
     return node
 
 
+async def _ready_cpu_node(
+    session, *, machine_id: str = "m-cpu", accelerator: str | None = "cpu"
+) -> Node:
+    """注册并造好无 GPU 数据（gpu_devices=[]）的就绪 CPU-only 节点
+    （accelerator 默认显式声明 cpu，可传 None 模拟 worker 未上报）。"""
+    svc = NodeService(session)
+    node = await svc.register(
+        NodeRegisterRequest(
+            machine_id=machine_id,
+            hostname=f"cpu-{machine_id}",
+            ip="10.0.0.2",
+            advertise_address="10.0.0.2:8100",
+            worker_port=8100,
+        )
+    )
+    # update_status 刷新存活时间（heartbeat_time）并派生状态，承担节点存活语义
+    await svc.update_status(
+        node.id,
+        NodeStatusReportRequest(
+            system_reserved=SystemReserved(ram=8 * _GIB, vram=0),
+            status=NodeStatus(
+                memory=MemoryInfo(
+                    total=64 * _GIB, used=10 * _GIB, utilization_rate=15.6
+                ),
+                gpu_devices=[],
+                accelerator=accelerator,
+            ),
+        ),
+    )
+    return node
+
+
 async def _create_ready_instance(session, monkeypatch, **overrides) -> VllmInstance:
     """创建实例（patch creation.request_to_worker：权重广播返回 2GiB，启动转发成功）。"""
     async def fake_request_to_worker(node, method, path, **kwargs):
@@ -362,6 +394,68 @@ async def test_create_success(session, monkeypatch):
         "tensor_parallel_size": 1,
         "args": [],
     }
+
+
+async def test_create_cpu_node(session, monkeypatch):
+    """CPU-only 节点（gpu_devices=[]）→ create 成功：allocator CPU 分支命中，
+    记录与启动 payload 的 gpu_indexes==[]、allocated_vram=={}。"""
+    node = await _ready_cpu_node(session)
+    calls = []
+
+    async def fake_request_to_worker(node, method, path, **kwargs):
+        calls.append((method, path, kwargs))
+        return FakeResponse({"weight_bytes": 2 * _GIB})
+
+    monkeypatch.setattr(
+        "app.server.instance.service.creation.request_to_worker",
+        fake_request_to_worker,
+    )
+
+    inst = await VllmInstanceService(session).create(
+        VllmInstanceCreateRequest(model_name="qwen2.5")
+    )
+
+    assert inst.id
+    assert inst.node_id == node.id
+    assert inst.state == InstanceStateEnum.PENDING.value
+    assert inst.target_state == InstanceTargetStateEnum.STARTING.value
+    assert inst.gpu_indexes == []
+    assert inst.allocated_vram == {}
+    assert inst.vram_claim == estimate_vram_claim(2 * _GIB)
+    assert inst.gpu_memory_utilization == 0.9
+
+    # 权重广播 + 启动转发两次调用，校验启动转发 payload
+    assert len(calls) == 2
+    method, path, kwargs = calls[-1]
+    assert method == "post"
+    assert path == f"instances/{inst.id}/start"
+    payload = kwargs["json"]
+    assert payload["instance_type"] == "vllm"
+    assert payload["gpu_indexes"] == []
+    assert payload["vram_claim"] == inst.vram_claim
+    assert payload["template"] == inst.template
+    assert payload["spec"]["model_name"] == "qwen2.5"
+
+
+async def test_create_empty_gpu_without_accelerator_rejected(session, monkeypatch):
+    """fail-closed 回归：gpu_devices=[] 且未声明 accelerator（None）→ create 分配拒绝，
+    不按空 GPU 列表推断为 CPU 节点（GPU 节点采集降级会误上报空列表）。"""
+    await _ready_cpu_node(session, machine_id="m-cpu-und", accelerator=None)
+
+    async def fake_request_to_worker(node, method, path, **kwargs):
+        return FakeResponse({"weight_bytes": 2 * _GIB})
+
+    monkeypatch.setattr(
+        "app.server.instance.service.creation.request_to_worker",
+        fake_request_to_worker,
+    )
+
+    with pytest.raises(OperationNotAllowedException) as excinfo:
+        await VllmInstanceService(session).create(
+            VllmInstanceCreateRequest(model_name="qwen2.5")
+        )
+    assert excinfo.value.details["operation"] == "create"
+    assert "显存分配失败" in excinfo.value.message
 
 
 async def test_create_snapshots_default_template(session, monkeypatch):

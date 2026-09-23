@@ -40,10 +40,13 @@ from app.utils.request_to_worker import request_to_worker
 # server 内置默认 docker 启动模板：**必须与 worker 侧
 # app/worker/process_utils.py 的 DEFAULT_VLLM_RUN_TEMPLATE 逐字符一致**
 # （防漂移注记：worker-contract §2.2；create 直落本常量快照下发，
-# worker 渲染 {port}/{model_path}/{gpu_indexes} 等由 worker 侧填写）
+# worker 渲染 {port}/{model_path}/{gpu_indexes} 等由 worker 侧填写；
+# {net_args}/{gpus_args} 为结构性网络/GPU 差异片段，由 worker 按
+# gpu_indexes 派生：GPU 节点 --network host + --gpus device=，CPU-only
+# 节点 -p {port}:{port} + 空串；CPU 三参数（--enforce-eager 等）走用户 args 透传）
 DEFAULT_VLLM_RUN_TEMPLATE = (
-    "docker run --name {name} --network host --shm-size {shm_size} "
-    "--gpus device={gpu_indexes} {mount_args} {env_args} {image} "
+    "docker run --name {name} {net_args} --shm-size {shm_size} "
+    "{gpus_args} {mount_args} {env_args} {image} "
     "{vllm_bin} serve {model_path} {args}"
 )
 
@@ -185,6 +188,7 @@ async def create_vllm_instance(
             workers.append(
                 WorkerResource(
                     node_id=node.id,
+                    accelerator=(node.status or {}).get("accelerator"),
                     gpu_devices=[
                         GPUResource(
                             index=g["index"],

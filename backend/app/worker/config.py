@@ -7,6 +7,7 @@ worker 不连 PG、不初始化任何扩展（database/redis/saq 均不加载）
 """
 
 from pathlib import Path
+from typing import Literal
 
 from pydantic import Field
 
@@ -61,6 +62,16 @@ class WorkerConfig(AppBaseConfig):
     )
     WORKER_SYSTEM_RESERVED_VRAM: int = Field(
         default=0, description="系统预留显存（Bytes，上报 system_reserved.vram）"
+    )
+    WORKER_ACCELERATOR: Literal["gpu", "cpu"] = Field(
+        default="gpu",
+        description="加速器类型（gpu|cpu）；cpu 为本机 CPU 集成测试显式声明，默认 gpu 保持 GPU 主战场 fail-closed",
+    )
+    WORKER_STARTUP_FAIL_THRESHOLD: int = Field(
+        default=2, description="starting 健康检查连续失败阈值（5s sync 周期 × N ≈ 快速失败）"
+    )
+    WORKER_STARTUP_TIMEOUT_SECONDS: int = Field(
+        default=30, description="starting 总预算秒数（模型加载超长兜底）"
     )
 
 

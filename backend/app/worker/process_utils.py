@@ -30,10 +30,13 @@ logger = logging.getLogger(__name__)
 # 默认 docker 启动模板：**必须与 server 端
 # server/instance/service/creation.py 的 DEFAULT_VLLM_RUN_TEMPLATE 逐字符一致**
 # （防漂移注记：worker-contract §2.2；worker 渲染 {port}/{model_path}/{gpu_indexes} 等
-# 由 worker 侧填写；缺省 template（含存量实例）用此内置模板兜底）
+# 由 worker 侧填写；缺省 template（含存量实例）用此内置模板兜底；
+# {net_args}/{gpus_args} 为结构性网络/GPU 差异片段，由 build_context 调用方按
+# gpu_indexes 派生：GPU 节点 --network host + --gpus device=，CPU-only 节点
+# -p {port}:{port} + 空串；CPU 三参数（--enforce-eager 等）走用户 args 透传）
 DEFAULT_VLLM_RUN_TEMPLATE = (
-    "docker run --name {name} --network host --shm-size {shm_size} "
-    "--gpus device={gpu_indexes} {mount_args} {env_args} {image} "
+    "docker run --name {name} {net_args} --shm-size {shm_size} "
+    "{gpus_args} {mount_args} {env_args} {image} "
     "{vllm_bin} serve {model_path} {args}"
 )
 
@@ -185,6 +188,8 @@ def build_context(
     model_path: str,
     port: str,
     gpu_indexes: str,
+    net_args: str,
+    gpus_args: str,
     shm_size: str,
     args_fragment: str,
     env_args: str,
@@ -196,6 +201,9 @@ def build_context(
     - vllm_bin 支持多词命令（如 `python -m vllm.entrypoints.openai.api_server`）：
       shlex.split 展开为多 token 后 join（每 token quote），渲染 + split 还原为独立 argv
     - args_fragment/env_args/mount_args 已是 shlex.join 后片段，**不再二次 quote**
+    - net_args/gpus_args 是**结构性网络/GPU 差异片段**（由调用方按 gpu_indexes 派生：
+      GPU 节点 --network host + --gpus device=，CPU-only 节点 -p {port}:{port} + 空串）；
+      CPU 三参数（--enforce-eager 等）是用户 args 透传，不在此。片段无空格/特殊字符，直接给
     - args 花括号（S2）**无需转义**：str.format 不解析替换值中的 `{`/`}`（原样输出）；
       含空格 token 由 shlex.join 引号包裹 → shlex.split 正确还原（如
       `{"max_tokens": 10}` 保持单 argv）；在值中做 `{`→`{{` 转义反而会输出双花括号
@@ -208,6 +216,8 @@ def build_context(
         "model_path": quote_arg(model_path),
         "port": str(port),
         "gpu_indexes": gpu_indexes,
+        "net_args": net_args,
+        "gpus_args": gpus_args,
         "shm_size": quote_arg(shm_size),
         "args": args_fragment,
         "env_args": env_args,

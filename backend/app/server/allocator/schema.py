@@ -15,6 +15,10 @@ class WorkerResource(BaseModel):
     """worker 节点资源快照（分配决策输入，由调用方聚合）。"""
 
     node_id: str = Field(description="节点 ID")
+    accelerator: str | None = Field(
+        default=None,
+        description="加速器类型（worker 显式声明 gpu|cpu）；仅 cpu 走 CPU 分配，None/未知按 GPU fail-closed",
+    )
     gpu_devices: list[GPUResource] = Field(description="GPU 设备列表")
     system_reserved_vram: int = Field(description="系统预留显存（Bytes，整机级，每卡都扣）")
     allocated_vram: dict[int, int] = Field(

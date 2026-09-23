@@ -26,6 +26,7 @@ def _noop_stop_container(name: str) -> bool:
 
 
 def _start_request(**spec_overrides) -> StartRequest:
+    gpu_indexes = spec_overrides.pop("gpu_indexes", [0])
     template = spec_overrides.pop("template", None)
     spec = {
         "model_name": "qwen2.5",
@@ -38,7 +39,7 @@ def _start_request(**spec_overrides) -> StartRequest:
     return StartRequest(
         instance_type="vllm",
         spec=VllmSpec(**spec),
-        gpu_indexes=[0],
+        gpu_indexes=gpu_indexes,
         vram_claim=16 * 1024**3,
         template=template,
     )
@@ -143,6 +144,93 @@ async def test_start_task_embedding_injects(manager, monkeypatch):
     await manager.start("i-1", _start_request(task="embedding"))
     cmd = captured["cmd"]
     assert cmd[cmd.index("--task") + 1] == "embed"
+
+
+async def test_start_cpu_no_gpu_fragments(manager, monkeypatch):
+    """CPU-only 节点（gpu_indexes=[]）start → 渲染用 CPU 片段：
+    -p {port}:{port}，不含 --gpus/--network host（空串片段）。"""
+    captured: dict = {}
+
+    class _FakePopen:
+        def __init__(self, cmd, **kwargs):
+            captured["cmd"] = cmd
+            self.pid = 999
+            self._code = None
+
+        def poll(self):
+            return self._code
+
+    monkeypatch.setattr("app.worker.lifecycle.subprocess.Popen", _FakePopen)
+    monkeypatch.setattr("app.worker.lifecycle.get_free_port", lambda **kw: 18080)
+
+    result = await manager.start("i-1", _start_request(gpu_indexes=[]))
+
+    assert result == {"status": "accepted"}
+    rec = manager._instances["i-1"]
+    assert rec.state == WorkerInstanceStateEnum.STARTING
+    assert rec.gpu_indexes == []
+    cmd = captured["cmd"]
+    assert cmd[0] == "docker" and cmd[1] == "run"
+    # CPU 片段：-p {port}:{port}（非 --network host），无 --gpus
+    assert "-p" in cmd and "18080:18080" in cmd
+    assert "--network" not in cmd
+    assert "--gpus" not in cmd
+    # vLLM 参数（模板 {args} 片段还原）：--port 补全、挂载/env 仍在
+    assert "18080" in cmd
+    assert "--served-model-name" in cmd
+    assert "-v" in cmd and "-e" in cmd
+
+
+async def test_start_gpu_env_injects_omp_and_safetensors(manager, monkeypatch):
+    """GPU 实例（gpu_indexes=[0]）env 片段含 OMP_NUM_THREADS=1 与 SAFETENSORS_FAST_GPU=1。"""
+    captured: dict = {}
+
+    class _FakePopen:
+        def __init__(self, cmd, **kwargs):
+            captured["cmd"] = cmd
+            self.pid = 999
+            self._code = None
+
+        def poll(self):
+            return self._code
+
+    monkeypatch.setattr("app.worker.lifecycle.subprocess.Popen", _FakePopen)
+    monkeypatch.setattr("app.worker.lifecycle.get_free_port", lambda **kw: 18080)
+
+    await manager.start("i-1", _start_request(gpu_indexes=[0]))
+
+    cmd = captured["cmd"]
+    assert "OMP_NUM_THREADS=1" in cmd
+    assert "SAFETENSORS_FAST_GPU=1" in cmd
+    # VLLM_CACHE_ROOT 仍注入（GPU/CPU 均保留）
+    assert any(arg.startswith("VLLM_CACHE_ROOT=") for arg in cmd)
+
+
+async def test_start_cpu_env_skips_omp_and_safetensors(manager, monkeypatch):
+    """CPU 实例（gpu_indexes=[]）env 片段不含 OMP_NUM_THREADS/SAFETENSORS_FAST_GPU
+    （CPU 推理注入 OMP_NUM_THREADS=1 会锁单线程，性能极差）；VLLM_CACHE_ROOT 保留。"""
+    captured: dict = {}
+
+    class _FakePopen:
+        def __init__(self, cmd, **kwargs):
+            captured["cmd"] = cmd
+            self.pid = 999
+            self._code = None
+
+        def poll(self):
+            return self._code
+
+    monkeypatch.setattr("app.worker.lifecycle.subprocess.Popen", _FakePopen)
+    monkeypatch.setattr("app.worker.lifecycle.get_free_port", lambda **kw: 18080)
+
+    await manager.start("i-1", _start_request(gpu_indexes=[]))
+
+    cmd = captured["cmd"]
+    assert not any(arg.startswith("OMP_NUM_THREADS=") for arg in cmd)
+    assert not any(arg.startswith("SAFETENSORS_FAST_GPU=") for arg in cmd)
+    # CPU 也保留 VLLM_CACHE_ROOT（缓存持久目录）
+    assert any(arg.startswith("VLLM_CACHE_ROOT=") for arg in cmd)
+    assert "-e" in cmd  # env 片段仍存在（VLLM_CACHE_ROOT）
 
 
 async def test_start_idempotent_returns_accepted(manager, monkeypatch):

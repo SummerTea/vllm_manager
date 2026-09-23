@@ -17,7 +17,9 @@ worker 只持内存态，经 register/status/report 三端点上报，
 - `schema.py`：`VllmSpec` + `StartRequest`（+gpu_indexes/vram_claim）+ `StopRequest`
   + `WeightRequest`/`WeightResponse`；worker 端点响应不要求 BaseResponse 包装
 - `server_client.py`：`ServerClient`（httpx.AsyncClient timeout=15 复用）；`collector.py`：
-  `WorkerStatusCollector`（无状态现采，pynvml + psutil）；`exceptions.py`：独立 JSON-only
+  `WorkerStatusCollector`（无状态现采，pynvml + psutil；status 载荷上报
+  `accelerator`——`WORKER_ACCELERATOR` 配置值 gpu|cpu，供 server 判定 CPU 分配）；
+  `exceptions.py`：独立 JSON-only
   异常处理器；`process_utils.py`：端口分配/docker 模板渲染（无 shell）/容器生命周期
   （stop_container/inspect_container）/路径/命令/env 片段
 - `lifecycle.py`：`InstanceLifecycleManager`（核心，内存态状态机）
@@ -61,13 +63,17 @@ worker 只持内存态，经 register/status/report 三端点上报，
   ④ 参数组装（`build_vllm_command`：用户 args 优先，缺省补 `--port`/
      `--served-model-name`/GMU/`--tensor-parallel-size`；task 映射：embedding→
      `--task embed`、rerank→`--task score`、auto/llm 不注入）
-  ⑤ env 注入（`build_env_args` 生成 `-e` 片段：OMP_NUM_THREADS/SAFETENSORS_FAST_GPU/
-     VLLM_CACHE_ROOT；GPU 经模板 `--gpus device={gpu_indexes}` 透传，**无
-     CUDA_VISIBLE_DEVICES**）+ 挂载片段（`-v` 模型根/缓存同路径）
-  ⑥ 模板渲染（`render_docker_command`：`format_map` → `shlex.split` → **argv 直传
-     Popen 无 shell**，docker run 前台 + stdout 日志重定向；缺省 template 用内置默认
-     兜底）+ 写 meta json（restore 用）；⑦ 失败 try/except 显式落 ERROR +
-     state_message（docker CLI 缺失 → retryable=False）
+   ⑤ env 注入（`build_env_args` 生成 `-e` 片段：OMP_NUM_THREADS/SAFETENSORS_FAST_GPU/
+      **仅 `gpu_indexes` 非空（GPU 实例）注入**——CPU-only 注入会把推理锁单线程；
+      VLLM_CACHE_ROOT GPU/CPU 都保留）+ 挂载片段（`-v` 模型根/缓存同路径）
+   ⑥ 模板渲染（`render_docker_command`：`format_map` → `shlex.split` → **argv 直传
+      Popen 无 shell**，docker run 前台 + stdout 日志重定向；缺省 template 用内置默认
+      兜底）+ 写 meta json（restore 用）；**结构性差异片段 `{net_args}`/`{gpus_args}`
+      按 `gpu_indexes` 空否派生**：GPU → `--network host` + `--gpus device=0,1`（**无
+      CUDA_VISIBLE_DEVICES**），CPU → `-p {port}:{port}` + 空串（CPU 三参数
+      --enforce-eager 等走用户 args 透传）；
+      ⑦ 失败 try/except 显式落 ERROR +
+      state_message（docker CLI 缺失 → retryable=False）
   → `sync_loop` 周期判定：docker CLI 已退出（poll 非 None，容器必然结束）→ 直接
   error + 退出码（code∈{125,126,127} → retryable=False 永久化）；健康检查
   （host 网络 `127.0.0.1:{port}` 直连 `/v1/models` 1s 200）：starting 连续失败 ≥N=2
@@ -107,7 +113,9 @@ worker 只持内存态，经 register/status/report 三端点上报，
   `WORKER_MODEL_ROOT`/`WORKER_VLLM_BIN`(vllm)/`WORKER_VLLM_IMAGE`(vllm/vllm-openai:latest)/
   `WORKER_VLLM_SHM_SIZE_GIB`(10.0)/`WORKER_LOG_DIR`/`WORKER_CACHE_DIR`/
   `WORKER_STATUS_INTERVAL`(15)/`WORKER_REPORT_INTERVAL`(5)/
-  `INSTANCE_DEFAULT_GMU`(0.9)/`WORKER_SYSTEM_RESERVED_RAM|VRAM`。
+  `INSTANCE_DEFAULT_GMU`(0.9)/`WORKER_SYSTEM_RESERVED_RAM|VRAM`/
+  `WORKER_ACCELERATOR`(gpu，显式声明 gpu|cpu)/`WORKER_STARTUP_FAIL_THRESHOLD`(2)/
+  `WORKER_STARTUP_TIMEOUT_SECONDS`(30，CPU 需调大)。
 - **参考实现**：gpustack `serve_manager.py`（生命周期/退避/端口/日志编号）、
   `backends/vllm.py`（命令/env 组装）——容器路径 psutil 递归树/`terminate_process_tree`
   已移除（停止走 docker stop/kill/rm）。

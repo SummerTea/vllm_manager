@@ -59,6 +59,9 @@ class NodeStatus(BaseModel):
     cpu: CPUInfo | None = Field(default=None, description="CPU 状态")
     memory: MemoryInfo | None = Field(default=None, description="内存状态")
     swap: SwapInfo | None = Field(default=None, description="交换分区状态")
+    accelerator: str | None = Field(
+        default=None, description="加速器类型（worker 显式声明：gpu|cpu；cpu 用于本机 CPU 集成测试）"
+    )
     gpu_devices: list[GPUDeviceStatus] | None = Field(default=None, description="GPU 设备列表")
     filesystem: list[dict[str, Any]] | None = Field(default=None, description="文件系统状态")
     os: dict | None = Field(default=None, description="操作系统信息")

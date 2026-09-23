@@ -34,6 +34,68 @@ def _res(
     )
 
 
+def _cpu_res(
+    node_id: str = "node-cpu", *, accelerator: str | None = "cpu"
+) -> WorkerResource:
+    """CPU-only 节点（无 GPU 设备）测试辅助工厂（accelerator 默认显式声明 cpu）。"""
+    return WorkerResource(
+        node_id=node_id,
+        gpu_devices=[],
+        accelerator=accelerator,
+        system_reserved_vram=0,
+        allocated_vram={},
+    )
+
+
+def test_cpu_only_node_hit():
+    """CPU-only 节点 + tp=1 → 命中：gpu_indexes=[]、allocated_vram={}、GMU 保持传入值。"""
+    worker = _cpu_res()
+    result = AllocatorService.first_fit(
+        [worker], vram_claim=20 * _GIB, gpu_memory_utilization=0.9
+    )
+    assert isinstance(result, AllocationResult)
+    assert result.node_id == "node-cpu"
+    assert result.gpu_indexes == []
+    assert result.allocated_vram == {}
+    assert result.gpu_memory_utilization == 0.9
+    assert result.vram_claim == 20 * _GIB
+
+
+def test_cpu_only_node_reject_tp2():
+    """CPU-only 节点 + tp=2 → 拒绝（CPU 无多卡并行），reason 含 CPU-only。"""
+    worker = _cpu_res()
+    result = AllocatorService.first_fit(
+        [worker],
+        vram_claim=20 * _GIB,
+        gpu_memory_utilization=0.9,
+        tensor_parallel_size=2,
+    )
+    assert isinstance(result, AllocationRejected)
+    assert "CPU-only" in result.reason
+    assert "tensor_parallel_size=2" in result.reason
+
+
+def test_empty_gpu_without_accelerator_rejected():
+    """fail-closed 回归：gpu_devices=[] 但未声明 accelerator（None）→ 拒绝，
+    不按空 GPU 列表推断为 CPU 节点（GPU 节点采集降级会上报空列表，推断会误分配）。"""
+    worker = _cpu_res(accelerator=None)
+    result = AllocatorService.first_fit(
+        [worker], vram_claim=20 * _GIB, gpu_memory_utilization=0.9
+    )
+    assert isinstance(result, AllocationRejected)
+    assert "无可用 GPU" in result.reason
+
+
+def test_empty_gpu_with_gpu_accelerator_rejected():
+    """fail-closed 回归：显式 accelerator=gpu 但采集降级 gpu_devices=[] → 拒绝（GPU 行为零变化）。"""
+    worker = _cpu_res(accelerator="gpu")
+    result = AllocatorService.first_fit(
+        [worker], vram_claim=20 * _GIB, gpu_memory_utilization=0.9
+    )
+    assert isinstance(result, AllocationRejected)
+    assert "无可用 GPU" in result.reason
+
+
 def test_single_gpu_hit():
     worker = _res()
     result = AllocatorService.first_fit(

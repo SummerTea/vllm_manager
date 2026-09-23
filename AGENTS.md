@@ -9,6 +9,7 @@ vLLM 推理服务集群管理平台。**server 端（节点/实例/allocator）+
 - `README.md`：工程快速上手（结构、启动、验证）
 - `docs/architecture.md`：**架构蓝图**——模块骨架与能力边界（server/worker/node 边界、依赖方向、契约、开发顺序；开发任何新模块前先读，守边界）
 - `docs/gpustack-borrowings.md`：**gpustack 借鉴调研**——vLLM 实例生命周期与显存分配的落地规格（写业务前必读）
+- `docs/local-testing.md`：**本地/CPU 集成测试指导**——colima + CPU 版镜像跑通 vLLM 全链路（`WORKER_ACCELERATOR=cpu` 显式声明 + `.env` 调参）
 - `backend/tests/`：样板契约测试（了解响应/异常/模型/URL 契约的实际写法）
 - `.slim/clonedeps/repos/gpustack__gpustack/codemap.md`：gpustack 参考源码的 Repository Atlas（深入参考前先读导航）
 
@@ -128,6 +129,7 @@ bun run build                    # 构建（tsc + vite）
 - `poetry run pytest` 全绿（新增业务须补契约测试，`backend/tests/` 仿照样板）
 - `poetry run ruff check app` 通过；pyright basic 模式不阻塞但保持干净
 - 本机 PG（127.0.0.1:5432/postgres/123456/vllm_manager）与 Redis（127.0.0.1:6379/123456）已就绪，`uvicorn` 启动 + curl 冒烟验证
+- 本机 CPU 集成测试见 `docs/local-testing.md`（worker 设 `WORKER_ACCELERATOR=cpu` 显式声明，colima 跑 vLLM 全链路）
 
 ## 前端开发约束
 

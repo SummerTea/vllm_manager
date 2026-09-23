@@ -31,7 +31,11 @@ _warned_no_gpu = False
 
 
 class WorkerStatusCollector:
-    """节点状态采集器（无状态；collect() 每次现采）。"""
+    """节点状态采集器（无状态；collect() 每次现采）。
+
+    上报 status.accelerator（WORKER_ACCELERATOR gpu|cpu）——server 据此判定
+    该节点是否走 CPU 显式声明的分配路径（GPU 主战场默认 gpu 不变）。
+    """
 
     def __init__(self, config: WorkerConfig):
         self._config = config
@@ -52,6 +56,7 @@ class WorkerStatusCollector:
                 "memory": self._collect_memory(),
                 "swap": self._collect_swap(),
                 "gpu_devices": self._collect_gpu_devices(),
+                "accelerator": self._config.WORKER_ACCELERATOR,
                 "filesystem": self._collect_filesystem(),
                 "os": self._collect_os(),
                 "kernel": self._collect_kernel(),

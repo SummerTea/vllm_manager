@@ -30,7 +30,8 @@ unreachable 标志 → unreachable；否则 → ready
   list/get/patch/delete **过渡期开放**（注释明示待 web 鉴权收敛，部署限内网）
 - `enum.py`：`NodeStateEnum`（pending/ready/offline/unreachable，LabeledStrEnum）
 - `schema.py`：NodeRegisterRequest/Response、NodeStatusReportRequest、NodeUpdateRequest、
-  NodeOut、GPUDeviceStatus 等
+  NodeOut、GPUDeviceStatus 等；`NodeStatus.accelerator`（worker 显式声明 gpu|cpu，
+  供 allocator 判定 CPU 分配，缺省/未知 fail-closed 按 GPU）
 
 ## Flow（数据与控制流）
 - 注册：POST /nodes/register（幂等；并发重复触发 uix_node_machine_id → rollback 后

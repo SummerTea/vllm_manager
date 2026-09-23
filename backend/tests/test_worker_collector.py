@@ -159,6 +159,24 @@ def test_collect_gpu_single_card_failure_skips(monkeypatch):
     assert devices[0]["index"] == 1
 
 
+def test_collect_accelerator_default_gpu(monkeypatch):
+    """默认配置（GPU 主战场）→ status.accelerator == "gpu"。"""
+    monkeypatch.setattr(collector_mod, "pynvml", None)
+    monkeypatch.setattr(collector_mod, "_PYNVML_AVAILABLE", False)
+    collector = _make_collector()
+
+    assert collector.collect()["status"]["accelerator"] == "gpu"
+
+
+def test_collect_accelerator_cpu_explicit(monkeypatch):
+    """显式 WORKER_ACCELERATOR=cpu → status.accelerator == "cpu"。"""
+    monkeypatch.setattr(collector_mod, "pynvml", None)
+    monkeypatch.setattr(collector_mod, "_PYNVML_AVAILABLE", False)
+    collector = _make_collector(WORKER_ACCELERATOR="cpu")
+
+    assert collector.collect()["status"]["accelerator"] == "cpu"
+
+
 def test_collect_system_fields_present(monkeypatch):
     """系统采集：cpu/memory/swap/filesystem/os/kernel/uptime 结构存在。"""
     monkeypatch.setattr(collector_mod, "pynvml", None)

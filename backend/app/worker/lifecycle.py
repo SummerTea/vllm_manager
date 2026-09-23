@@ -53,10 +53,9 @@ from app.worker.schema import StartRequest, WeightRequest
 
 logger = logging.getLogger(__name__)
 
-# 健康检查失败阈值与启动总预算（docs/worker-contract.md §3）
-# 5s sync 周期 × 2 ≈ 10s 快速失败；30s 总预算兜底（模型加载超长时）
-_STARTUP_FAIL_THRESHOLD = 2
-_STARTUP_TIMEOUT_SECONDS = 30
+# starting 健康检查失败阈值与启动总预算读 WorkerConfig
+# （WORKER_STARTUP_FAIL_THRESHOLD/WORKER_STARTUP_TIMEOUT_SECONDS，docs/worker-contract.md §3；
+# 5s sync 周期 × N ≈ 快速失败；总预算兜底模型加载超长）
 # RUNNING 失活阈值（语义独立于 starting 启动失败，值相同：5s×2≈10s）
 _RUNTIME_FAIL_THRESHOLD = 2
 
@@ -247,8 +246,13 @@ class InstanceLifecycleManager:
         )
         args_fragment = join_arg_fragment(full_cmd[3:])
 
-        # env -e 片段（OMP/SAFETENSORS/VLLM_CACHE_ROOT；GPU 由 --gpus 透传）
-        env_items = {"OMP_NUM_THREADS": "1", "SAFETENSORS_FAST_GPU": "1"}
+        # env -e 片段：OMP_NUM_THREADS/SAFETENSORS_FAST_GPU 仅 GPU 实例注入
+        # （CPU-only 场景注入 OMP_NUM_THREADS=1 会把推理锁单线程，性能极差；
+        #  GPU 行为不变）；VLLM_CACHE_ROOT 逻辑 GPU/CPU 都保留
+        env_items: dict[str, str] = {}
+        if record.gpu_indexes:
+            env_items["OMP_NUM_THREADS"] = "1"
+            env_items["SAFETENSORS_FAST_GPU"] = "1"
         cache_vllm = self._config.WORKER_CACHE_DIR / "vllm"
         try:
             cache_vllm.mkdir(parents=True, exist_ok=True)
@@ -272,13 +276,25 @@ class InstanceLifecycleManager:
             ]
         )
 
+        # 结构性网络/GPU 差异片段：gpu_indexes 非空 → GPU（--network host + --gpus
+        # device=），空 → CPU-only（-p {port}:{port} + 无 --gpus）；CPU 三参数
+        # （--enforce-eager 等）走用户 args 透传（build_vllm_command 的 args 片段）
+        gpu_indexes_str = ",".join(str(i) for i in record.gpu_indexes)
         context = build_context(
             name=name,
             image=self._config.WORKER_VLLM_IMAGE,
             vllm_bin=self._config.WORKER_VLLM_BIN,
             model_path=record.model_path,
             port=str(record.port),
-            gpu_indexes=",".join(str(i) for i in record.gpu_indexes),
+            gpu_indexes=gpu_indexes_str,
+            net_args=(
+                "--network host"
+                if gpu_indexes_str
+                else f"-p {record.port}:{record.port}"
+            ),
+            gpus_args=(
+                f"--gpus device={gpu_indexes_str}" if gpu_indexes_str else ""
+            ),
             shm_size=f"{self._config.WORKER_VLLM_SHM_SIZE_GIB:g}g",
             args_fragment=args_fragment,
             env_args=env_args,
@@ -454,11 +470,12 @@ class InstanceLifecycleManager:
                 else:
                     record.fail_count += 1
                     if (
-                        record.fail_count >= _STARTUP_FAIL_THRESHOLD
+                        record.fail_count
+                        >= self._config.WORKER_STARTUP_FAIL_THRESHOLD
                         or (
                             record.last_restart_time is not None
                             and (now - record.last_restart_time).total_seconds()
-                            > _STARTUP_TIMEOUT_SECONDS
+                            > self._config.WORKER_STARTUP_TIMEOUT_SECONDS
                         )
                     ):
                         record.state = WorkerInstanceStateEnum.ERROR

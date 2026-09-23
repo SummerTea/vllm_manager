@@ -63,6 +63,20 @@ class AllocatorService:
         tensor_parallel_size: int,
     ) -> AllocationResult | AllocationRejected:
         """在单个节点内尝试分配；失败返回该节点首个失败原因。"""
+        # 显式声明才走 CPU 分配——不按空 gpu_devices 推断（GPU 节点采集降级会上报
+        # 空列表，推断会 fail-open 误分配）；CPU-only：gpu_indexes=[]、allocated_vram={}，显存不校验
+        if worker.accelerator == "cpu":
+            if tensor_parallel_size > 1:
+                return AllocationRejected(
+                    reason=f"节点 {worker.node_id} 为 CPU-only，不支持 tensor_parallel_size={tensor_parallel_size}"
+                )
+            return AllocationResult(
+                node_id=worker.node_id,
+                gpu_indexes=[],
+                gpu_memory_utilization=gmu,
+                vram_claim=vram_claim,
+                allocated_vram={},
+            )
         if tensor_parallel_size == 1:
             return AllocatorService._try_worker_single(worker, vram_claim, gmu)
         return AllocatorService._try_worker_multi(
