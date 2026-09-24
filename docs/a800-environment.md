@@ -1,7 +1,7 @@
 # A800 主机环境台账（10.1.251.230 / master / 2×A800 80GB）
 
 > 定位：本工程维护的 A800 主机环境**持续台账**——硬件/软件/服务/部署物「当前已知状态 + 如何取实时值 + 变更日志」。
-> 权威环境参考：`.agents/skills/a800-server/SKILL.md` + `references/*`（login/environment/container-usage/model-download）——环境事实以 skill 为准，本文件记录工程侧变更与部署物，并与之对齐。
+> 环境事实以本台账为准（数值实时自取，§1-6 命令）；历史外部 skill（`.agents/skills/a800-server/`，属外部工程）**已移除**，本文件自洽、不依赖其存在；工程侧部署物与变更见 §4/§7，runbook 见 `docs/a800-worker-deploy.md`。
 > 维护规则：环境变更（起/停服务、部署、磁盘/显存显著变化）后**更新本文件**并追加 §7 变更日志行（日期+变更+责任方）；数值标「<日期> 时点」，实时值用 §1-6 的命令现取。
 
 ## 0. 快速总览（2026-09-24 收尾后状态）
@@ -25,7 +25,7 @@
   实时：`nproc` / `free -h`。
 - 磁盘：`/nfsdata` 2.0T（剩 ~144G，2026-09-24 时点，93%）；`/` 292G（剩 ~23G，2026-09-24 时点，92%）。
   实时：`df -h /nfsdata /`；**红线：系统盘 `/` 勿写大文件（只剩 ~23G）**。
-- 主机：master，Ubuntu 内核 5.15.0-190-generic（skill 旧记为 gpuserver01，以实测 master 为准）。
+- 主机：master，Ubuntu 内核 5.15.0-190-generic（历史旧记 gpuserver01，以实测 master 为准）。
 
 ## 2. 软件
 
@@ -57,7 +57,7 @@
 | evalscope | luckfu/evalscope:latest | Up 13 days | 9000 | 他人，勿动 |
 | qwen-image-2512 | harbor vllm-omni:v0.28.0 | Up 9 days | 8091 | 他人，勿动 |
 
-- 常驻进程：GPU0 **kronos**（末次 ~57G 显存，**勿杀/勿动**）；skill 记载另有 comfyui 等常驻（本机 docker 未见 comfyui 容器，以 skill references 为准、勿臆断）。
+- 常驻进程：GPU0 **kronos**（末次 ~57G 显存，**勿杀/勿动**）；外部 skill 曾记载另有 comfyui 等常驻，但本机 docker 未见 comfyui 容器——**勿臆断，以实时 `docker ps -a` 为准**。
 - 本工程测试容器：`vllm-{instance_id}`（A800 worker 拉起，用后即停；实时 `docker ps -a | grep vllm-`，末次 2026-09-24 为 0）。
 - 本机 server/worker 侧：**master 节点记录保留**（当前 offline，重启 A800 worker 即 ready）——见本机 PG（`vllm_manager_node` 表）与 runbook §4。
 - 归属确认纪律：docker stop/kill 前必 `docker inspect`（runbook §5 有样例）。
@@ -84,9 +84,9 @@
 ## 6. 模型库（/nfsdata/models/，实时：`ls /nfsdata/models/`）
 
 - **本工程测试用**：`Qwen/Qwen3-0.6B`（1.5G，含 model.safetensors；worker `resolve_model_path` 支持子目录式模型名——G3 已验证）；顶层另有独立 `Qwen3-0.6B`（2.9G）目录。
-- 其他（摘要，勿整表复制）：`Qwen3-4B-Instruct-2507` / `Qwen3-4B-Thinking-2507` / `Qwen3.5-35B-A3B` / `Qwen3.8-27B` 系列 / `GLM-5.3-Flash-AWQ-W4A16` / `GLM-5.3-Flash-W4A8` / `MiniMax-H3` / `Qwen-Image-2512` / `FLUX.2-dev` / `CogVideoX-2b` / `DeepSeek-OCR` / `SenseVoiceSmall` / `Qwen2___5-0___5B-Instruct` 等——完整清单引用 skill `references/environment.md`。
+- 其他（摘要，勿整表复制）：`Qwen3-4B-Instruct-2507` / `Qwen3-4B-Thinking-2507` / `Qwen3.5-35B-A3B` / `Qwen3.8-27B` 系列 / `GLM-5.3-Flash-AWQ-W4A16` / `GLM-5.3-Flash-W4A8` / `MiniMax-H3` / `Qwen-Image-2512` / `FLUX.2-dev` / `CogVideoX-2b` / `DeepSeek-OCR` / `SenseVoiceSmall` / `Qwen2___5-0___5B-Instruct` 等——完整清单以实时 `ls /nfsdata/models/` 为准。
 - 体积参考：`du -sh /nfsdata/models/{Qwen/Qwen3-0.6B,Qwen3-0.6B}`（末次 1.5G / 2.9G）。
-- 模型下载/管理操作 → skill `references/model-download.md`。
+- 模型下载/管理操作 → 按外部 skill 同款流程（hf-mirror / ModelScope 双通道，大权重 302 到 AWS CDN 被拒时回退 ModelScope）自行准备。
 
 ## 7. 变更日志（时间倒序）
 

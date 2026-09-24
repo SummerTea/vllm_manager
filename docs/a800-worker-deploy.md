@@ -1,10 +1,10 @@
 # A800 服务器集成 runbook（vllm_manager worker + 通用 GPU 集成地基）
 
 > 定位：指导本工程在 `10.1.251.230`（主机名 master，2×A800 80GB）做各类集成工作的**可执行 runbook**。
-> 权威环境参考：`.agents/skills/a800-server/SKILL.md` + `references/*`（`login.md` / `environment.md` / `container-usage.md` / `model-download.md` / `eval-data-download.md`）——**环境事实以 skill 为准**，本文件只放工程集成特有内容（部署/运维/决策）并引用之，不复制漂移。
+> 环境事实以本文件 + `docs/a800-environment.md`（主机环境台账）为准，数值实时自取（§1 命令）；历史外部 skill（`.agents/skills/a800-server/`，属外部工程）**已移除**，本文件内容自洽、不依赖其存在。
 > 集成测试结论：`docs/local-testing.md` §8（A800 GPU 测试结论，B/C/D 场景矩阵、产品 bug、记账缺口决策、收尾）。
 >
-> **红线（skill + 本工程）**：只动自己创建的东西；`gemma4-26b-a4b` 已授权停且**不恢复**；`kronos` / `pdf2md×3` / `evalscope` / `qwen-image`（及 skill 记载的常驻 `comfyui` 等）一律不碰；代码/venv/日志全落 `/nfsdata`（**系统盘 `/` 勿写，skill 记只剩 ~1.4G**）；私钥 `~/.ssh/a800_ed25519` 仅本机使用、**禁止上传/提交**；SSH 批量命令合并成单连接防限流（遇 `Permission denied` 为瞬时限流，`sleep 8` 重试，见 §5）。
+> **红线（本工程）**：只动自己创建的东西；`gemma4-26b-a4b` 已授权停且**不恢复**；`kronos` / `pdf2md×3` / `evalscope` / `qwen-image`（及历史时点曾记载的常驻 `comfyui` 等）一律不碰；代码/venv/日志全落 `/nfsdata`（**系统盘 `/` 勿写，历史时点剩 ~1.4G，以实时为准**）；私钥 `~/.ssh/a800_ed25519` 仅本机使用、**禁止上传/提交**；SSH 批量命令合并成单连接防限流（遇 `Permission denied` 为瞬时限流，`sleep 8` 重试，见 §5）。
 
 ---
 
@@ -14,7 +14,7 @@
 
 1. 部署 vllm_manager worker（:8100）并注册到本机 server（:8000）。
 2. 起 GPU vLLM 实例，验证分配/编排闭环（B/C/D 场景，结论与关键值见 `docs/local-testing.md` §8）。
-3. 其他 GPU 集成（SMG 路由 / KV 传输 / 镜像改造 / 能力验证等）——地基与运维复用本 runbook，业务步骤按 skill references。
+3. 其他 GPU 集成（SMG 路由 / KV 传输 / 镜像改造 / 能力验证等）——地基与运维复用本 runbook，业务步骤按外部 skill 同款流程自行准备。
 
 **流程**：**地基绿（§1）→ 一次性部署（§2）→ 连通性（§3）→ 日常操作（§4）→ 收尾（§8）**；故障排查见 §5，已知约束与决策见 §6，历史证据快照见 §7。每次集成工作开始前先过一遍 §1 地基绿。
 
@@ -22,7 +22,7 @@
 
 ## 1. 地基绿检查（每次集成前，可复制命令块）
 
-### 1.1 登录（skill login.md：SSH 密钥免密）
+### 1.1 登录（SSH 密钥免密）
 
 ```bash
 ssh -i ~/.ssh/a800_ed25519 -o StrictHostKeyChecking=no asiainfo@10.1.251.230 'uptime'
@@ -48,11 +48,11 @@ ssh -i ~/.ssh/a800_ed25519 -o StrictHostKeyChecking=no asiainfo@10.1.251.230 \
 
 | 项 | 检查命令 | 完成标准 |
 |---|---|---|
-| GPU | `nvidia-smi --query-gpu=index,memory.used,memory.free --format=csv,noheader` | **2 张 A800**。GPU0 通常有外部进程 `kronos` 占用（skill 基线记 ~8G；G1 时点实测 57G——**数值一律以实时为准**）；GPU1 停 gemma4 后通常全空 |
+| GPU | `nvidia-smi --query-gpu=index,memory.used,memory.free --format=csv,noheader` | **2 张 A800**。GPU0 通常有外部进程 `kronos` 占用（历史时点记 ~8G 与 G1 实测 57G 两种口径——**数值一律以实时为准**）；GPU1 停 gemma4 后通常全空 |
 | 容器 | `docker ps -a --format "table {{.Names}}\t{{.Image}}\t{{.Status}}"` | 确认各容器归属（gemma4 Exited、他人容器 Up 未动）；本次工作前应无 `vllm-*` 容器 |
-| 磁盘 | `df -h /nfsdata /` | `/nfsdata` 有空间（skill 现记剩 ~165G；G1 时点 145G）；**`/` 系统盘勿写**（skill 现记剩 ~1.4G 危险，G1 时点 23G） |
-| 镜像 | `docker images \| grep vllm` | harbor `vllm/vllm-openai:v0.26.0`（本项目 worker 用）在；skill 另记 `vllm-openai-smg:v0.26.0` 一镜像两用（SMG 类集成优先，见 skill container-usage） |
-| 模型 | `ls /nfsdata/models/` | `Qwen/Qwen3-0.6B`（1.5G）等已就绪，勿重复下载（下载通道见 skill model-download） |
+| 磁盘 | `df -h /nfsdata /` | `/nfsdata` 有空间（历史时点剩 ~165G / G1 时点 145G，以实时为准）；**`/` 系统盘勿写**（历史时点剩 ~1.4G 危险 / G1 时点 23G，以实时为准） |
+| 镜像 | `docker images \| grep vllm` | harbor `vllm/vllm-openai:v0.26.0`（本项目 worker 用）在；另有 `vllm-openai-smg:v0.26.0` 一镜像两用（SMG 类集成优先，以实时 `docker images` 为准） |
+| 模型 | `ls /nfsdata/models/` | `Qwen/Qwen3-0.6B`（1.5G）等已就绪，勿重复下载（下载通道按外部 skill 同款流程自行准备，见 `docs/a800-environment.md` §6） |
 | 端口 | `ss -tln \| grep -E ":8100|:8000"` | worker 用 **8100 空闲**；8000 是 gemma4 曾用（已停，释放） |
 
 **完成标准**：以上各项明确/存在/为空且与预期一致，地基即绿。
@@ -101,7 +101,7 @@ curl -fsSL https://repo.anaconda.com/miniconda/Miniconda3-py311_26.7.1-1-Linux-x
 ```
 
 > **`nvidia-ml-py` 必须装**（pynvml）：缺失 → worker 启动时 gpu_devices 上报降级为空列表（采集优雅降级但节点变无 GPU），补装后重启即恢复（§5）。
-> 注：skill environment 对**容器内** pip 包优先华为云源；宿主机 venv 用阿里云是 G1 实测路径，两者不冲突。
+> 注：**容器内** pip 包优先华为云源；宿主机 venv 用阿里云是 G1 实测路径，两者不冲突。
 
 ### 2.4 import 验证
 
@@ -237,7 +237,7 @@ ssh -i ~/.ssh/a800_ed25519 -o StrictHostKeyChecking=no asiainfo@10.1.251.230 \
 | 子目录模型名 weight 404 → create 500 | worker 跑的是旧代码（`resolve_model_path` 已修复） | rsync 修复版（§2.1）→ 重启（§4.1） |
 | tp>1 只挂首卡 / `World size(2)>GPUs(1)` | worker 旧代码（`gpus_args` 未改内引号版） | rsync 修复版 → 重启 → 容器内 `nvidia-smi -L` 应见 2 卡 |
 | vLLM 启动 error「显存不足」 | allocator 恒选 GPU0 且不消费外部占用（账面通过），worker 启动时刻 pynvml 校验拒启 | 调低 GMU 至真实空余以下；或配置 `WORKER_SYSTEM_RESERVED_VRAM` 预留（见 §6） |
-| vLLM 启动即退（argparse 错误） | v0.26.0 的 `--disable-log-requests` **已移除** | 用 `--no-enable-log-requests`（skill container-usage 同证） |
+| vLLM 启动即退（argparse 错误） | v0.26.0 的 `--disable-log-requests` **已移除** | 用 `--no-enable-log-requests`（G1–G3 实测同证） |
 | 首启超 240s（启动超时 error） | torch.compile 首启 1-3min 属正常 | 40/240 阈值**非契约固定**，按实测放宽重测 |
 | 隧道断线 → 节点 offline / 实例冻结 starting | 隧道单连接断开（G1 实测过远端关闭） | 重建隧道（§3）≤15s 自愈；offline/冻结是预期，非 bug |
 | pid 文件 PID 无效 | nohup 块 `$!` 可能记 bash wrapper PID | 以 `ps aux \| grep "python app/work_worker.py"` 为准（§4.1） |
@@ -251,10 +251,10 @@ ssh -i ~/.ssh/a800_ed25519 -o StrictHostKeyChecking=no asiainfo@10.1.251.230 \
 | 系统 python 3.10 用不了 `StrEnum`（`base_enum.py`） | **装 Python 3.11 环境，不改代码**（miniconda 官方源；TUNA 镜像 md5 损坏弃用；`/nfsdata/miniconda3` 他人 root:700 勿碰，用自有路径） | G1 部署记录 |
 | **allocator 记账缺口**：`available = total − Σallocated − system_reserved` **不消费 `memory_used`**（外部占用如 kronos 被当全空），first-fit 恒选 GPU0 | 用户决策**方案 A：维持现状**（与 gpustack 同构，不照搬「消费 memory_used」——陈旧性/双重计数/外部不可控三重风险）；kronos 类单卡占用用 **`WORKER_SYSTEM_RESERVED_VRAM` 配置预留**缓解（**整机级每卡都扣，单卡被占场景作用有限**）；worker 启动时刻 pynvml `_check_vram` 是兜底边界（**不覆盖运行期渐进占用**） | `docs/local-testing.md` §8.4 |
 | 缺口实证（G2） | 24GiB claim → allocator 账面通过 → worker 拒启 error（GPU1 全空也不换卡）；并发账面 Σ32GiB 不超、真实逼近极限时 vLLM Engine init 失败（自身 OOM 兜底，无炸机） | `docs/local-testing.md` §8.2/§8.4 |
-| vLLM v0.26.0 参数语义 | `--no-enable-log-requests`（旧名已移除）；GMU：0.6B 平台测 0.2 落 GPU0（16GiB），skill 手工起容器记 0.3~0.35；torch.compile 首启 1-3min | skill container-usage + G3 实测 |
+| vLLM v0.26.0 参数语义 | `--no-enable-log-requests`（旧名已移除）；GMU：0.6B 平台测 0.2 落 GPU0（16GiB），手工起容器另有 0.3~0.35 口径；torch.compile 首启 1-3min | G3 实测 |
 | VPN 单向（A800 无法直连本机） | 反向隧道是**必然架构**（§3），`SERVER_URL` 恒 `127.0.0.1:8000`；server→worker 直连 `10.1.251.230:8100`（ADVERTISE） | G1 连通性实测 |
 | 多卡 `--gpus device=1,0` 只挂首卡（docker 26.0.2） | 平台模板已改**内引号版** `--gpus '"device=1,0"'`（NVIDIA 官方多卡 workaround）→ A800 实测 tp=2 running | `docs/local-testing.md` §8.3 |
-| 磁盘红线 | 代码/venv/日志全落 `/nfsdata`；`/` 系统盘勿写（skill 记剩 ~1.4G 危险） | skill environment + SKILL 红线 |
+| 磁盘红线 | 代码/venv/日志全落 `/nfsdata`；`/` 系统盘勿写（历史时点剩 ~1.4G 危险，以实时为准） | 历史台账 + 本文件红线 |
 
 ---
 
@@ -264,7 +264,7 @@ ssh -i ~/.ssh/a800_ed25519 -o StrictHostKeyChecking=no asiainfo@10.1.251.230 \
 
 | 验证项 | G1 时点值 |
 |---|---|
-| 节点注册 | machine_id=master、hostname=master（skill environment 记 hostname=gpuserver01，以实时为准）、ip=10.1.251.230、worker_port=8100、**state=ready**、unreachable=false |
+| 节点注册 | machine_id=master、hostname=master（历史旧记 gpuserver01，以实测为准）、ip=10.1.251.230、worker_port=8100、**state=ready**、unreachable=false |
 | heartbeat | 15s 周期持续刷新 |
 | status.accelerator | `gpu` |
 | gpu_devices | 2 条：index 0/1，均为 NVIDIA A800 80GB PCIe，memory_total=85899345920（80GiB/卡） |
