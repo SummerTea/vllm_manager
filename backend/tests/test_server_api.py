@@ -6,6 +6,7 @@ sqlite 内存库 session（不触发 lifespan，不需要真实 PG/Redis）。
 每个测试独立 session/engine（conftest session 夹具为 function 级）。
 """
 
+from datetime import datetime, timedelta
 from unittest.mock import patch
 
 import pytest
@@ -17,6 +18,7 @@ import app.server.node.model  # noqa: F401  (注册 Node 到 Base.metadata)
 from app.extensions.database import get_session
 from app.main import app
 from app.server.instance.model import VllmInstance
+from app.server.node.model import Node
 from app.server.node.service import NodeService
 
 _BASE = "/vllm_manager/api/v1/nodes"
@@ -170,6 +172,79 @@ def test_delete_node_with_active_instance_409(api_client, session):
 
     assert resp.status_code == 409
     assert "活跃实例" in resp.json()["message"]
+
+
+def test_node_delete_liveness_guard(api_client):
+    """存活守卫：心跳新鲜（ready）节点删除 → 409（防删活节点造成实例孤儿）。"""
+    data = _register(api_client)
+    # 上报一次 status 刷新 heartbeat → 节点 ready（心跳宽限期内）
+    api_client.post(
+        f"{_BASE}/{data['node_id']}/status",
+        headers=_auth(data["token"]),
+        json={
+            "system_reserved": {"ram": 0, "vram": 0},
+            "status": {"gpu_devices": []},
+        },
+    )
+
+    resp = api_client.delete(f"{_BASE}/{data['node_id']}")
+
+    assert resp.status_code == 409
+    assert "仍存活" in resp.json()["message"]
+
+
+def test_node_delete_offline_allowed(api_client, session):
+    """心跳超时（offline）节点删除 → 200（存活守卫不拦）。"""
+    node = Node(
+        id="test-node-off-0000000000000000",
+        machine_id="m-off",
+        hostname="gpu-off",
+        ip="10.0.0.3",
+        advertise_address="10.0.0.3:8100",
+        worker_port=8100,
+        token="t" * 64,
+        heartbeat_time=datetime.now() - timedelta(hours=1),
+    )
+    session.add(node)
+
+    resp = api_client.delete(f"{_BASE}/{node.id}")
+
+    assert resp.status_code == 200
+    assert api_client.get(f"{_BASE}/{node.id}").status_code == 404
+
+
+def test_node_delete_cascades_stopped_instances(api_client, session):
+    """offline 节点 + stopped 实例 → DELETE 200 且实例被级联删除（GET 404）。"""
+    node = Node(
+        id="test-node-cas-0000000000000000",
+        machine_id="m-cas",
+        hostname="gpu-cas",
+        ip="10.0.0.4",
+        advertise_address="10.0.0.4:8100",
+        worker_port=8100,
+        token="t" * 64,
+        heartbeat_time=datetime.now() - timedelta(hours=1),
+    )
+    session.add(node)
+    inst = VllmInstance(
+        id="test-inst-cas-0000000000000000",
+        node_id=node.id,
+        state="stopped",
+        target_state="none",
+        model_name="qwen2.5",
+        gpu_indexes=[0],
+        args=[],
+        labels={},
+        allocated_vram={},
+        restart_count=0,
+    )
+    session.add(inst)
+
+    resp = api_client.delete(f"{_BASE}/{node.id}")
+
+    assert resp.status_code == 200
+    assert api_client.get(f"{_BASE}/{node.id}").status_code == 404
+    assert api_client.get("/vllm_manager/api/v1/instances/" + inst.id).status_code == 404
 
 
 def test_register_integrity_error_fallback(api_client):

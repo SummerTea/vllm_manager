@@ -88,13 +88,15 @@ class VllmInstanceService(BaseCrudService[VllmInstance]):
 
         node_crud = NodeReadOnlyCrud(self.session)
         node = await node_crud.get_by_id(inst.node_id)
+        if node is None:
+            # 节点不存在（已删/孤儿实例）→ 报「实例所在节点不存在」直接浮出，
+            # 不经 ExternalServiceException 二次包装（与 stop 行为对齐）。
+            raise ExternalServiceException(
+                "实例所在节点不存在",
+                service_name="worker",
+                details={"node_id": inst.node_id},
+            )
         try:
-            if node is None:
-                raise ExternalServiceException(
-                    "实例所在节点不存在",
-                    service_name="worker",
-                    details={"node_id": inst.node_id},
-                )
             await request_to_worker(
                 node,
                 "post",
@@ -292,6 +294,25 @@ class VllmInstanceService(BaseCrudService[VllmInstance]):
         for inst in instances:
             inst.state = InstanceStateEnum.UNREACHABLE.value
             inst.state_message = "节点失联"
+        await self.session.flush()
+        logger.info(
+            "节点失联联动: node=%s 置 unreachable %s 条", node.id, len(instances)
+        )
+        return len(instances)
+
+    async def delete_stopped_by_node(self, node_id: str) -> int:
+        """级联删除节点下已 stopped 实例（stopped 终态不转发 stop，直接物理删）。
+
+        供节点删除编排使用：节点删除前清理其残留 stopped 实例，防孤儿占账。
+        """
+        instances = await self.get_list(
+            sa_filters=[
+                VllmInstance.node_id == node_id,
+                VllmInstance.state == InstanceStateEnum.STOPPED.value,
+            ]
+        )
+        for inst in instances:
+            await self.session.delete(inst)
         await self.session.flush()
         return len(instances)
 

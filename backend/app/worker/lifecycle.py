@@ -611,8 +611,11 @@ class InstanceLifecycleManager:
         """
         meta_dir = self._config.WORKER_LOG_DIR / "instances"
         if not meta_dir.is_dir():
+            logger.info("restore: 无实例 meta 目录 %s，跳过恢复", meta_dir)
             return
-        for meta_path in meta_dir.glob("*.json"):
+        meta_paths = list(meta_dir.glob("*.json"))
+        recovered = 0
+        for meta_path in meta_paths:
             try:
                 meta = json.loads(meta_path.read_text(encoding="utf-8"))
                 instance_id = meta["instance_id"]
@@ -647,6 +650,7 @@ class InstanceLifecycleManager:
                 self._instances[record.instance_id] = record
                 if record.port is not None:
                     self._assigned_ports.add(record.port)
+                recovered += 1
                 logger.info(
                     "restore 实例 %s（容器 vllm-%s, port=%s）",
                     record.instance_id,
@@ -658,6 +662,9 @@ class InstanceLifecycleManager:
                 logger.warning("实例 meta 解析失败，删除: %s", meta_path)
                 with contextlib.suppress(OSError):
                     meta_path.unlink(missing_ok=True)
+        logger.info(
+            "restore 汇总: 恢复 %s / meta 总数 %s 个", recovered, len(meta_paths)
+        )
 
     # ---------- 清理 ----------
 

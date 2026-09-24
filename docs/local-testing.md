@@ -251,3 +251,81 @@ worker 侧已有两处正确降级（无需改）：`_check_vram`（pynvml 不�
 > `vllm serve vllm serve <path>` → exit 2）。**存量实例若 template 快照是旧格式
 > （含 `{vllm_bin} serve`），需 delete + create 重建**才会下发新模板；worker 侧
 > `{vllm_bin}` 键仍兼容旧格式模板渲染（不 KeyError）。
+
+---
+
+## 7. 集成测试场景矩阵与验收结论
+
+> 来源：`.slim/deepwork/local-integration-testing.md`（2026-09 本机全链路集成测试
+> A–E 场景进度与证据，全部执行通过）。编号 = 验收清单：A 环境基线 / B 节点域 /
+> C 资源分配 / D 编排生命周期 / E 节点边界。
+>
+> **测试环境现状与证据位置**：日志在 `/tmp/vllm_mgr_itest/`（server.log /
+> worker.log / pids /）；本机 PG 已清理历史残留表（`nodes`/`vllm_instances` 已 DROP，
+> `state_message` 两表已 ALTER 统一 TEXT）。mock GPU 节点脚本
+> `/tmp/vllm_mgr_itest/mock_worker.py`（stdlib 纯脚本，临时用不入库）：/healthz 200、
+> start→记 phantom→200、stop→200（phantom 保留，供 D8）、weight→404、status/report
+> 线程周期上报。
+
+### A 环境基线（全部通过）
+
+| 编号 | 场景 | 结论与关键观察 |
+|---|---|---|
+| A1 | colima/docker context/镜像/模型/端口预检 | 通过：colima 4CPU/8GiB/aarch64，CPU 镜像与 Qwen3-0.6B 就绪 |
+| A2 | PG schema 与 ORM 对齐 | 通过：无缺列，未 ALTER |
+| A3 | server 启动装配冒烟 | 通过：PG+Redis+SAQ+lifespan prober 装配，GET /nodes 200 |
+| A4 | worker 启动（CPU 注入参数） | 通过：注册成功日志 + /healthz 200 |
+
+### B 节点域（全部通过）
+
+| 编号 | 场景 | 结论与关键观察 |
+|---|---|---|
+| B1 | 注册幂等 | 通过：重启重复注册 → 同 node_id/token **逐字符不变**，不新增节点 |
+| B2 | 状态监控 | 通过：accelerator=cpu、gpu_devices=[] 优雅降级（告警 3 次=3 进程各 1）、status/system_reserved/heartbeat_time 落库、state=ready、API 列表/过滤正确 |
+| B3 | 鉴权 | 通过：错误 token→401；跨节点 token→403；/healthz 免鉴权 200 |
+| B4 | 掉线时间线 | 通过：kill worker → 15s unreachable（心跳仍新鲜）→ 30s offline |
+| B5 | 不可达（假节点） | 通过：注册 closed-port 假节点 → 上报 ready → probe fail → unreachable |
+| B6 | 失联联动 | 通过：running 实例 → ≤15s node unreachable → 实例 unreachable「节点失联」（不删除） |
+| B7 | 恢复 | 通过：重启 worker → 幂等注册同 node_id → 短暂 unreachable ≤15s 自愈 ready → 首次 report 即回 running、port 保持 |
+
+### C 资源分配（全部通过）
+
+| 编号 | 场景 | 结论与关键观察 |
+|---|---|---|
+| C1a | 权重广播 + 需求估算 | 通过：`model_weight_bytes=1503300328`（精确）；`vram_claim=3951444041`（=×1.2+2GiB estimate） |
+| C1b | 无模型拒绝路径 | 通过：create 不存在模型 → 500 EXTERNAL_SERVICE_ERROR（契约 500，非 502）；worker /models/weight → 404 |
+| C2 | CPU 分配分支 | 通过：`gpu_indexes=[]`、`allocated_vram={}`、GMU/args 落库 |
+| C3 | 拒绝路径 | 通过：tp=2 / gmu=1.5 / vram_claim=0 / 随机 node_id / is_active=false → 全部 400 OPERATION_NOT_ALLOWED，reason 符合预期 |
+| C4a | 单卡命中 | 通过：mock 2×24GiB+2GiB 预留，单卡 `[0]` 记 12GiB |
+| C4b | tp=2 分组 | 通过：`[0,1]` 各记 12GiB，Σ≥claim |
+| C4c | 超单卡上限 + pin 修复 | 通过：22GiB/gmu0.9 → 400「超单卡上限 21.6GiB」；P0 修复（指定 node_id 分配 fallthrough，`07e8468`）后 pin 不再跨节点落位 |
+| C4d | 系统预留扣减 | 通过：连续 2 实例占满后第 3 个 400「可用率 42% < GMU 50%」（available=24−12−2GiB 预留，每卡扣） |
+| C5 | 并发 create 串行化 | 通过：advisory lock 串行化，双 200、各记 12GiB、Σ=24GiB=total 不超卖；实测 resp=[1]/[0]（第二请求换卡，防超卖正确结果） |
+| C6 | 多实例端口 | 通过：第二实例 port 58857≠58707 不冲突；error 实例 25s+ 无自动重启（retryable=False 语义） |
+
+### D 编排 / 生命周期（全部通过）
+
+| 编号 | 场景 | 结论与关键观察 |
+|---|---|---|
+| D1 | 全链路创建 | 通过：create → pending/target=starting → port 58707 → running（~50s）→ target 收敛 none |
+| D2 | 推理冒烟 | 通过：/v1/models 200 + chat/completions 返回内容 |
+| D3 | stop 收敛 | 通过：target=stopping → docker stop/rm → 5s 收敛 stopped（空快照链路 ✓） |
+| D4 | delete | 通过：stopped 直删；running 先转发 stop 再删；docker 0 残留 |
+| D5 | 再启动 | 通过：stopped → start → 新端口 58934 → running |
+| D6 | error 清理 | 通过：非法 flag → error「docker run 进程已退出（code=2）」；stop（error→stopping→stopped 守卫 ✓）→ delete |
+| D7 | 自愈重启 | 通过：docker kill → 10s error「进程失活」→ delay-0 重启（restart_count=1）→ ~40s running；3min 观察稳定 |
+| D8 | stop 悬挂（mock） | 通过：stop 后 mock 保持报 running → 轮询 60s retry 1→2→3 →「停止指令多次未生效，需人工介入」；四元组 `running + stopping + 人工介入 + retry==3` 全命中 |
+| D9 | 空快照对账 | 通过：空 phantom 仍上报空 items，/instances/report 200 累计 651 条、异常 4 条全预期 |
+
+### E 节点边界（全部通过）
+
+| 编号 | 场景 | 结论与关键观察 |
+|---|---|---|
+| E1 | 删除守卫 | 通过：running 时 DELETE node → 409；stop → stopped → DELETE → 200；重启 worker → 新 node_id（原节点已删） |
+| E2 | is_active 候选排除 | 通过：is_active=false + pin create → 400「指定节点不可用」；还原后 ready |
+| E3 | labels PATCH | 通过：两次 PATCH → 整体替换语义（{a:1}→{b:2} 后仅 b:2） |
+
+> **收口说明**：P0 修复（指定 node_id 分配 fallthrough）已提交 `07e8468`；Phase 4 用户
+> 决策「node 删除 = 存活守卫（READY/UNREACHABLE 心跳宽限内 409）+ 级联删 stopped
+> 实例」已在 `docs/worker-contract.md` §1.4 契约化（代码随 Lane R 落地）；PENDING 节点
+> 超时规则与 pin 广播裁剪本期不做（文档化，见 deepwork 进度文件）。

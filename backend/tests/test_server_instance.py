@@ -1330,3 +1330,80 @@ async def test_assert_node_deletable(session, monkeypatch):
     inst.state = InstanceStateEnum.STOPPED.value
     await session.flush()
     await VllmInstanceService(session).assert_node_deletable(node.id)  # 不抛
+
+
+async def test_delete_stopped_by_node(session):
+    """级联删除：仅删该节点下 stopped 实例（stopped 终态不转发 stop），返回条数。"""
+    node1 = await _ready_node(session, machine_id="m-dsn-1")
+    node2 = await _ready_node(session, machine_id="m-dsn-2")
+    stopped1 = VllmInstance(
+        node_id=node1.id,
+        state=InstanceStateEnum.STOPPED.value,
+        target_state=InstanceTargetStateEnum.NONE.value,
+        model_name="qwen2.5",
+        gpu_indexes=[0],
+        args=[],
+        labels={},
+        allocated_vram={},
+        restart_count=0,
+    )
+    stopped2 = VllmInstance(
+        node_id=node1.id,
+        state=InstanceStateEnum.STOPPED.value,
+        target_state=InstanceTargetStateEnum.NONE.value,
+        model_name="qwen2.5",
+        gpu_indexes=[0],
+        args=[],
+        labels={},
+        allocated_vram={},
+        restart_count=0,
+    )
+    running_other_node = VllmInstance(
+        node_id=node2.id,
+        state=InstanceStateEnum.RUNNING.value,
+        target_state=InstanceTargetStateEnum.NONE.value,
+        model_name="qwen2.5",
+        gpu_indexes=[0],
+        args=[],
+        labels={},
+        allocated_vram={},
+        restart_count=0,
+    )
+    session.add_all([stopped1, stopped2, running_other_node])
+    await session.flush()
+
+    count = await VllmInstanceService(session).delete_stopped_by_node(node1.id)
+
+    assert count == 2
+    assert await VllmInstanceService(session).get_by_id(stopped1.id) is None
+    assert await VllmInstanceService(session).get_by_id(stopped2.id) is None
+    # 其他节点实例不受影响
+    assert await VllmInstanceService(session).get_by_id(running_other_node.id) is not None
+
+
+async def test_start_orphan_node_missing_message(session):
+    """孤儿 start 文案：节点行已删（模拟存量孤儿）→ start 报「实例所在节点不存在」
+    而非被二次包装成「启动指令转发失败」（与 stop 行为对齐）。"""
+    node = await _ready_node(session)
+    inst = VllmInstance(
+        node_id=node.id,
+        state=InstanceStateEnum.STOPPED.value,
+        target_state=InstanceTargetStateEnum.NONE.value,
+        model_name="qwen2.5",
+        gpu_indexes=[0],
+        args=[],
+        labels={},
+        allocated_vram={},
+        restart_count=0,
+    )
+    session.add(inst)
+    await session.flush()
+    # 绕过 API 存活守卫直接删节点行，模拟存量孤儿实例
+    await session.delete(node)
+    await session.flush()
+
+    with pytest.raises(ExternalServiceException) as ei:
+        await VllmInstanceService(session).start(inst.id)
+
+    assert "实例所在节点不存在" in str(ei.value)
+    assert "启动指令转发失败" not in str(ei.value)

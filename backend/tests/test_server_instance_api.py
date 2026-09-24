@@ -412,7 +412,7 @@ def test_report_ignores_foreign_instance(api_client, monkeypatch):
     assert detail.json()["data"]["state"] == InstanceStateEnum.PENDING.value
 
 
-def test_create_pinned_node_no_fallthrough(api_client, monkeypatch):
+def test_create_pinned_node_no_fallthrough(api_client):
     """P0：指定 node_id 创建时分配被约束在指定节点——GPU 节点不满足条件时
     不得 fallthrough 到 CPU 等其他候选（防实例落错节点 / 记账错乱）。"""
     # GPU 节点（1 卡 24GiB、reserved 2GiB，候选顺序靠前）
@@ -443,14 +443,6 @@ def test_create_pinned_node_no_fallthrough(api_client, monkeypatch):
             "system_reserved": {"ram": 0, "vram": 0},
             "status": {"accelerator": "cpu", "gpu_devices": []},
         },
-    )
-
-    async def fake_request_to_worker(node, method, path, **kwargs):
-        return FakeResponse({"weight_bytes": 2 * _GIB})
-
-    monkeypatch.setattr(
-        "app.server.instance.service.creation.request_to_worker",
-        fake_request_to_worker,
     )
 
     # 指定 GPU 节点但 vram_claim 超其单卡上限（24GiB×0.9=21.6GiB < 22GiB）

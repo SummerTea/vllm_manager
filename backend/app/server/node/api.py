@@ -8,7 +8,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.base.base_request_schema import PaginationParams
 from app.base.base_response_schema import BaseResponse, EmptyResponse, PageResponse
-from app.exception import ForbiddenException, ResourceNotExistException
+from app.config import app_config
+from app.exception import (
+    ConflictException,
+    ForbiddenException,
+    ResourceNotExistException,
+)
 from app.extensions.database import get_session
 
 # 唯一反向只读跨域例外：node 删除守卫消费 instance 域能力（assert_node_deletable）
@@ -152,10 +157,32 @@ async def delete_node(
 ) -> EmptyResponse:
     """删除节点（物理删除）。
 
-    节点存在活跃实例时必须 409 拒绝删除（跨域守卫：VllmInstanceService.assert_node_deletable）。
+    新语义（按序）：
+    1. 节点不存在 → 404；
+    2. **存活守卫**：重派生状态为 ready/unreachable（心跳宽限期内心跳新鲜或
+       探测可达）→ 409 拒绝——防删活节点造成实例孤儿（worker 仍会续报心跳，
+       误删后对账无法收敛）；
+    3. 活跃实例守卫（既有 assert_node_deletable）→ 409；
+    4. 级联删除该节点已 stopped 实例（stopped 终态不转发 stop，直接物理删）；
+    5. NodeService.delete 物理删除。
     """
+    service = NodeService(session)
+    node = await service.get_by_id(node_id)
+    if node is None:
+        raise ResourceNotExistException(
+            "节点不存在", resource_type="node", resource_id=node_id
+        )
+    node.compute_state(app_config.NODE_HEARTBEAT_GRACE_PERIOD)
+    if node.state in (
+        NodeStateEnum.READY.value,
+        NodeStateEnum.UNREACHABLE.value,
+    ):
+        raise ConflictException(
+            f"节点 {node_id} 的 worker 仍存活（心跳宽限期内），拒绝删除"
+        )
     await VllmInstanceService(session).assert_node_deletable(node_id)
-    deleted = await NodeService(session).delete(node_id)
+    await VllmInstanceService(session).delete_stopped_by_node(node_id)
+    deleted = await service.delete(node_id)
     if not deleted:
         raise ResourceNotExistException(
             "节点不存在", resource_type="node", resource_id=node_id

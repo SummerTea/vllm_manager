@@ -216,6 +216,48 @@ worker ──/instances/report 上报实际 state/port/restart_count──▶ se
 > 非 2xx（server 透传失败信号），供上述对账重下发兜底；仅确认容器已停止/清理才清
 > 记录（`process_utils.stop_container` 返回 bool）。
 
+> **Gate 3 注记（D8 stop 重下发预算烧毁）**：`target_retry_count` 在调度前递增——
+> worker 失联期间对账触发的重下发预算会被烧掉，最终归因「人工介入」
+> （`state_message`「停止指令多次未生效，需人工介入」）。此时实例本就处于
+> `unreachable`/悬挂态，运维介入方向正确，属**可接受语义**（预算烧毁 ≠ 资源泄漏：
+> stop 幂等，worker 恢复后仍可重下发）。
+
+> **Gate 3 注记（实例 PENDING 卡死逃生路径）**：`pending`/`starting` + 永久失联 worker
+> 的实例**永不收敛**（`target=starting` 时上报消失走「其余消失不动」，不收敛
+> stopped）、持续占 `allocated_vram`，且直接 delete 因转发 stop 失败抛 500。**逃生
+> 路径**：先 `POST /instances/{id}/stop`（`target=stopping` → 上报消失 → 收敛
+> stopped）再 delete——不能期望 delete 一步到位。
+
+### 1.4 `DELETE /vllm_manager/api/v1/nodes/{node_id}`
+
+- **鉴权**：过渡期管理端点暂未接入会话鉴权（部署约束：仅限内网/本机，禁止暴露公网）。
+- **语义**：节点删除 = **机器退役**。守卫与清理顺序（`node/api.py:delete_node`）：
+  1. **存活守卫**：`compute_state` 派生状态 ∈ {`READY`, `UNREACHABLE`}（心跳宽限
+     `NODE_HEARTBEAT_GRACE_PERIOD`，默认 30s）→ **409 拒绝**「worker 仍存活」——
+     只允许**无存活 worker**（`PENDING`/`OFFLINE`）时删除。语义：删 node = 机器退役，
+     心跳宽限内（可能只是网络抖动/探测窗口）禁删，防误删仍在线的 worker 节点。
+  2. **活跃实例守卫**：存在非 `stopped` 实例 → **409 拒绝**（保留，
+     `assert_node_deletable`）。
+  3. **级联删除本节点 stopped 实例**（防孤儿）：节点删除后其 stopped 实例无重启路径
+     （worker 重启会注册新 node_id）——级联物理删除，杜绝「实例恒显示 + start 报
+     『实例所在节点不存在』」的孤儿记录。
+- **worker 侧无需感知**：worker 失联后重启即重新注册（幂等键 machine_id 已删 → 新
+  node_id + 新 token）；节点删除不向 worker 发任何指令。
+- **响应**：`BaseResponse`（删除成功）。
+
+> **Gate 3 复审注记（并发窄边，极端场景，不修仅知悉）**：
+> 1. **start 在途 ∥ 级联删除**：节点 `OFFLINE`（存活守卫通过）+ 实例 `stopped`（活跃
+>    守卫通过）+ 用户 start 在途（`target=starting` 已落库、state 仍 `stopped`）+ worker
+>    恰能受理 start 的并发窗口下，级联删除可能产生孤儿容器 + worker 内存记录被 server
+>    忽略。窗口前提苛刻（OFFLINE 却 worker 进程活着、同一事件循环内 status 循环不发
+>    心跳），单进程 asyncio 下近乎不可能，仅单向网络分区可达——文档化，不为它加
+>    target 校验。
+> 2. **worker 复活 ∥ 删除**：节点 `OFFLINE` → delete 事务（毫秒级）期间 worker 重启
+>    复用旧 node_id 注册成功 → delete 提交后该 worker 上报走 404（仅 warning 不重注册，
+>    重注册只在 lifespan）→ **容器孤儿直至手动二次重启**。与上文「worker 重启会注册新
+>    node_id」的差异：此竞态下 worker 已重启过，不会自动获得新 node_id——极端并发下
+>    需**二次重启自愈**。
+
 ## 2. server→worker 端点
 
 路径**不带** `/vllm_manager/api/v1` 前缀（`build_worker_url` 直接拼
@@ -404,6 +446,14 @@ Phase B 容器化后走 docker run 模板渲染）：
   命令缺失/daemon 不可达/超时/输出损坏）≠ 容器消失，**保留 meta + 告警**待下次重试
   （防 docker 短暂不可用时误删 meta → 实例被对账 stopped → 显存超卖）；容器不存在/
   Exited/dead → 删 meta（不恢复）。
+
+> **Gate 3 注记（restore 瞬态失败空快照收敛边界）**：worker 恢复时 `restore` 遇**瞬态
+> docker 探针异常**（命令缺失/daemon 不可达/超时）→ 保留 meta 但无内存记录 → 实例
+> 快照为空 → 上报「消失」；若此时实例 `target=stopping`，server 按「上报消失 → 收敛
+> stopped」会把**可能仍在跑的容器误判为已停止**，且 M2 守卫（stopped 后不接受非
+> stopped 上报）使 worker 后续恢复上报被**永久拦截**（状态分叉：容器在跑、server 记
+> stopped）。该边界需 4 条件巧合（stop 悬挂 + worker 崩溃 + 瞬态探针失败 + 容器仍活），
+> **本期文档化接受、不做修复**。
 - **健康检查**：进程存活（docker CLI pid）&& `GET /v1/models` 200（单次 1s 超时）→
   `running`（GPU host 网络 / CPU `-p` 端口映射均 `127.0.0.1:{port}` 直连容器）；
   docker CLI 已退出 → 容器必然结束，直接判 error；**starting 超时总预算**：连续健康
@@ -428,6 +478,13 @@ Phase B 容器化后走 docker run 模板渲染）：
 - **与 server 对账联动**：worker 无主动拉取，只上报；server 侧节点失联时对
   `running` 实例置 `unreachable`（不删除，人工介入），恢复后对账拉回；
   `target=stopping` 但上报仍非 stopped → server 限次重下发 stop（见 §1.3 规则 3）。
+
+> **Gate 3 注记（D7 kill∥stop 并发）**：docker kill 容器与 stop 指令并发时——sync
+> **STARTING 分支**的 CLI 退出快速判错可能在 stop 进行中被并发写入 `error`（记录随后
+> 被 `stop()` pop，无害）；**RUNNING 分支**检测 CLI 退出走健康阈值（~10s 连续失败）
+> 而非立即判错。双层兜底：`_launch_container` 在 `stop_container` await 后防御性重
+> 校验 + `_maybe_restart` 锁内重校验——最坏浪费一轮重启周期后收敛，**无端口泄漏/孤儿
+> 容器**。
 
 ## 4. 鉴权与错误处理
 
