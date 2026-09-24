@@ -150,6 +150,13 @@ worker ──/instances/report 上报实际 state/port/restart_count──▶ se
 
 - **响应**：`BaseResponse{code=0, message="success", data=null}`。
 
+> **`unreachable` 标志语义（prober 独占）**：`unreachable` 是 **server→worker 回连方向**的
+> 失败记录（`prober._probe_node` 探测 `/healthz` 非 200/网络失败时置 True，成功时置 False），
+> **status 上报不清除**——status 是 worker→server 方向，上报成功 ≠ 回连可达（反例：advertise
+> address 配置错误/单向防火墙，worker 照常上报但指令转发全失败）。因此 worker 重启后首轮
+> 状态轮询窗口内节点可能短暂显示 `unreachable`（心跳已刷新但上一轮探测失败标志未清），
+> **≤ 一个探测周期（`NODE_PROBE_INTERVAL`，默认 15s）自愈回 `ready`**——属契约行为，非故障。
+
 ### 1.3 `POST /vllm_manager/api/v1/instances/report`
 
 - **鉴权**：Bearer（worker 节点 token，`get_current_node`；**仅处理本节点实例**，

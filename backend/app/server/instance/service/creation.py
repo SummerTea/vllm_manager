@@ -207,6 +207,10 @@ async def create_vllm_instance(
             )
 
         # 6. allocator first-fit 决策
+        # 指定 node_id 时仅在该节点内分配：first_fit 不应跨候选 fallthrough，
+        # 否则指定 GPU 节点不满足条件时实例会静默落到 CPU 等其他节点（落错节点）。
+        if data.node_id is not None:
+            workers = [w for w in workers if w.node_id == data.node_id]
         result = AllocatorService.first_fit(
             workers, vram_claim, gmu, data.tensor_parallel_size
         )

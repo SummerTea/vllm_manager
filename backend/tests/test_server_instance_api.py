@@ -410,3 +410,60 @@ def test_report_ignores_foreign_instance(api_client, monkeypatch):
     # 非本节点实例未被改动
     detail = api_client.get(f"{_BASE}/{inst['id']}")
     assert detail.json()["data"]["state"] == InstanceStateEnum.PENDING.value
+
+
+def test_create_pinned_node_no_fallthrough(api_client, monkeypatch):
+    """P0：指定 node_id 创建时分配被约束在指定节点——GPU 节点不满足条件时
+    不得 fallthrough 到 CPU 等其他候选（防实例落错节点 / 记账错乱）。"""
+    # GPU 节点（1 卡 24GiB、reserved 2GiB，候选顺序靠前）
+    gpu = _register(api_client, machine_id="gpu-pin", hostname="gpu-pin")
+    api_client.post(
+        f"{_NODES}/{gpu['node_id']}/status",
+        headers=_auth(gpu["token"]),
+        json={
+            "system_reserved": {"ram": 0, "vram": 2 * _GIB},
+            "status": {
+                "gpu_devices": [
+                    {
+                        "index": 0,
+                        "name": "Mock GPU",
+                        "memory_total": 24 * _GIB,
+                        "memory_used": 0,
+                    }
+                ],
+            },
+        },
+    )
+    # CPU 节点（accelerator=cpu、gpu_devices=[]，first_fit CPU 分支无条件命中）
+    cpu = _register(api_client, machine_id="cpu-pin", hostname="cpu-pin")
+    api_client.post(
+        f"{_NODES}/{cpu['node_id']}/status",
+        headers=_auth(cpu["token"]),
+        json={
+            "system_reserved": {"ram": 0, "vram": 0},
+            "status": {"accelerator": "cpu", "gpu_devices": []},
+        },
+    )
+
+    async def fake_request_to_worker(node, method, path, **kwargs):
+        return FakeResponse({"weight_bytes": 2 * _GIB})
+
+    monkeypatch.setattr(
+        "app.server.instance.service.creation.request_to_worker",
+        fake_request_to_worker,
+    )
+
+    # 指定 GPU 节点但 vram_claim 超其单卡上限（24GiB×0.9=21.6GiB < 22GiB）
+    resp = api_client.post(
+        _BASE,
+        json={
+            "model_name": "qwen2.5",
+            "node_id": gpu["node_id"],
+            "vram_claim": 22 * _GIB,
+            "gpu_memory_utilization": 0.9,
+        },
+    )
+
+    assert resp.status_code == 400
+    reason = resp.json()["data"]["details"]["reason"]
+    assert "超单卡上限" in reason
