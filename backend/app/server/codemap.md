@@ -37,4 +37,4 @@ server ──request_to_worker─────────▶ worker(healthz/star
 - `node/codemap.md`：GPU 节点域（登记幂等/心跳/状态上报/主动探测/worker 鉴权）
 - `instance/codemap.md`：vLLM 实例域（生命周期字段/状态机纯函数/对账/失联联动）
 - `instance/service/codemap.md`：实例服务层（create 编排/启停/对账/守卫）
-- `allocator/codemap.md`：显存分配决策（first-fit 纯函数，零 DB/网络）
+- `allocator/codemap.md`：显存分配决策（first-fit 纯函数，零 DB/网络；GPU 路径 + 仅显式 `accelerator=cpu` 的 CPU 路径，其余 fail-closed 走 GPU 拒绝）

@@ -11,12 +11,13 @@
   节点尝试，首个命中即返回；参数校验（GMU∈(0,1]、vram_claim>0、tp≥1）不满足直接
   拒绝；`_try_worker` 按 tp 分流单卡/多卡策略；**CPU 分配门控 = 显式
   `worker.accelerator == "cpu"`**——分配 `gpu_indexes=[]`、`allocated_vram={}`、
-  tp>1 拒绝；**fail-closed：GPU / 未声明 / `gpu_devices` 空一律走 GPU 路径拒绝**
-  （不按空 `gpu_devices` 推断 CPU——GPU 节点采集降级也会上报空列表，推断会 fail-open
-  误分配）
+  显存不校验、tp>1 拒绝；**fail-closed：GPU / 未声明 / `gpu_devices` 空一律走
+  GPU 路径拒绝**（不按空 `gpu_devices` 推断 CPU——GPU 节点采集降级也会上报空列表，
+  推断会 fail-open 误分配）
 - 单卡（tp=1）`_try_worker_single`：逐卡判定 `available/total ≥ GMU` 且
   `claim ≤ total×GMU`，双条件同真才命中
-- 多卡（tp>1）`_try_worker_multi`：按 gpu_type 同型号分组，组内按可用显存降序取
+- 多卡（tp>1）`_try_worker_multi`：按 gpu_type 同型号分组（`gpu_type` None 归
+  `<unknown>`），组内仅可用率 `> GMU`（严格大于）的卡入围，按可用显存降序取
   tp 张，`Σ(total×GMU) ≥ claim` 命中（tp>1 必须同型号——vLLM 张量并行硬约束）
 - `schema.py`：`GPUResource`（index/memory_total/gpu_type）/ `WorkerResource`（节点
   快照，含 `accelerator`——worker 显式声明 gpu|cpu，None/未知按 GPU fail-closed）/
@@ -28,6 +29,7 @@
 ## Flow（数据与控制流）
 - 记账口径（`_available`）：
   `单卡可用 = max(total − Σ已分配(allocated_vram) − 系统预留(system_reserved_vram，整机级每卡都扣), 0)`
+  以 allocated_vram 账本为准，**不消费 node.status 的 memory_used 实时值**
 - 命中记账：`allocated_vram = {gpu_index: int(total×GMU)}`（per-gpu 占账口径；
   vram_claim 仅作需求校验阈值，非记账值）
 - 失败语义：记录首个失败原因（可用率不足 / 超单卡上限 / 同型号数量不足 / tp 总和

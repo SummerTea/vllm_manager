@@ -9,7 +9,7 @@ FastAPI 应用装配层（server 管理端 :8000 的入口与容器）：集中�
 - **lifespan**（lifespan.py）：`init_logging` → 按 `DISABLED_EXTENSIONS` 跳过式 `init_db(create_tables=(DEPLOY_ENV==DEVELOPMENT))` → `init_redis` → `init_saq` → 启动 `node.prober.probe_loop` 后台任务（依赖 DB，db 禁用时不启动）；组合根装配 `on_node_lost` 回调：探测失联节点批量交给 `VllmInstanceService.reconcile_lost_nodes` 联动（running→unreachable），跨域装配只发生在此（node 域零跨域 import，回调是参数）；yield 后反向取消任务、关 redis、dispose db、停日志。
 - **全局异常处理**（exceptions.py）：
   - `APIRequestIDMiddleware`：仅对 API 路径注入/透传 `X-Request-ID`。
-  - 分层 handler：`HttpException`（status_code 直映）→ `BusinessException`（默认 400，`ResourceNotExistException`→404、`DuplicateResourceException`→409）→ 兜底 `VllmManagerException`（500）；另有 FastAPI `HTTPException`/`RequestValidationError`(422)/`Exception` 兜底。
+  - 分层 handler：`HttpException`（status_code 直映）→ `BusinessException`（默认 400，`ResourceNotExistException`→404、`DuplicateResourceException`→409）→ 兜底 `VllmManagerException`（500）；另有 `HttpClientException`（worker 转发错误透传：取 `details.status_code` 透传 worker 状态码，worker 401/403 映射 502——worker 鉴权失败不代表 server 登录态失效，防前端误判被踢）、FastAPI `HTTPException`/`RequestValidationError`(422)/`Exception` 兜底。
   - **API vs SPA 双轨**：API 路径回 `BaseResponse` JSON（含 request_id/error_code/details）；非 API 回 HTML；SPA 深路由 404 回 `index.html`（`Cache-Control: no-cache` 防 hash chunk 过期），但静态资源缺失（按 `/assets` 前缀 + 扩展名后缀判定）回 404 JSON，避免 module script 拿到 text/html 白屏。
 - **SafeStaticFiles**（static_files.py）：覆写 `check_config` 为空操作 + `get_response` 兜底 404，使前端产物缺失时静默挂载。
 
