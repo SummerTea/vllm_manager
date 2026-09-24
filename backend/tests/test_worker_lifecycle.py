@@ -113,7 +113,7 @@ async def test_start_success_creates_starting_record(manager, monkeypatch):
     assert cmd[cmd.index("--name") + 1] == "vllm-i-1"
     assert cmd[cmd.index("--network") + 1] == "host"
     assert cmd[cmd.index("--shm-size") + 1] == "10g"
-    assert cmd[cmd.index("--gpus") + 1] == "device=0"
+    assert cmd[cmd.index("--gpus") + 1] == '"device=0"'
     assert "vllm/vllm-openai:latest" in cmd
     assert "serve" not in cmd  # A1：镜像 ENTRYPOINT 承担 vllm serve，模板不再拼 serve
     model_path = str(manager._config.WORKER_MODEL_ROOT / "qwen2.5")
@@ -302,7 +302,7 @@ async def test_start_default_template_when_missing(manager, monkeypatch):
 
     cmd = captured["cmd"]
     assert cmd[cmd.index("--network") + 1] == "host"
-    assert cmd[cmd.index("--gpus") + 1] == "device=0"
+    assert cmd[cmd.index("--gpus") + 1] == '"device=0"'
     assert cmd[cmd.index("--shm-size") + 1] == "10g"
 
 

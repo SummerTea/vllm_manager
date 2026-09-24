@@ -280,9 +280,11 @@ class InstanceLifecycleManager:
             ]
         )
 
-        # 结构性网络/GPU 差异片段：gpu_indexes 非空 → GPU（--network host + --gpus
-        # device=），空 → CPU-only（-p {port}:{port} + 无 --gpus）；CPU 三参数
-        # （--enforce-eager 等）走用户 args 透传（build_vllm_command 的 args 片段）
+        # 结构性网络/GPU 差异片段：gpu_indexes 非空 → GPU（--network host +
+        # 内引号 --gpus '"device=0,1"'：render_docker_command 走 shlex.split，
+        # argv 值含字面双引号 "device=0,1" → docker CLI 收到即 nvidia 官方
+        # 多卡 workaround，tp>1 双卡识别），空 → CPU-only（-p {port}:{port} + 无
+        # --gpus）；CPU 三参数（--enforce-eager 等）走用户 args 透传
         gpu_indexes_str = ",".join(str(i) for i in record.gpu_indexes)
         context = build_context(
             name=name,
@@ -297,7 +299,7 @@ class InstanceLifecycleManager:
                 else f"-p {record.port}:{record.port}"
             ),
             gpus_args=(
-                f"--gpus device={gpu_indexes_str}" if gpu_indexes_str else ""
+                f"--gpus '\"device={gpu_indexes_str}\"'" if gpu_indexes_str else ""
             ),
             shm_size=f"{self._config.WORKER_VLLM_SHM_SIZE_GIB:g}g",
             args_fragment=args_fragment,

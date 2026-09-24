@@ -72,12 +72,16 @@ def instance_meta_path(log_dir: Path, instance_id: str) -> Path:
 def resolve_model_path(model_root: Path, model_name: str) -> Path:
     """解析模型目录路径。
 
-    - model_name 为绝对路径或含路径分隔符 → 直用
-    - 否则 model_root / model_name
+    - model_name 为绝对路径 → 直用
+    - 否则 model_root / model_name（含子目录式，如 Qwen/Qwen3-0.6B 拼为
+      {model_root}/Qwen/Qwen3-0.6B）
     - 目录不存在 → 抛 NotFoundException(404)
+
+    注记 `..` 穿越：start 路径由 S6 根外校验兜底拒启；weight 路径为只读扫描
+    不防（P3 信息暴露级，不另加守卫）。
     """
     name = Path(model_name)
-    path = name if name.is_absolute() or "/" in model_name else model_root / model_name
+    path = name if name.is_absolute() else model_root / model_name
     if not path.is_dir():
         raise NotFoundException(f"模型目录不存在: {path}")
     return path
@@ -205,8 +209,11 @@ def build_context(
       shlex.split 展开为多 token 后 join（每 token quote），渲染 + split 还原为独立 argv
     - args_fragment/env_args/mount_args 已是 shlex.join 后片段，**不再二次 quote**
     - net_args/gpus_args 是**结构性网络/GPU 差异片段**（由调用方按 gpu_indexes 派生：
-      GPU 节点 --network host + --gpus device=，CPU-only 节点 -p {port}:{port} + 空串）；
-      CPU 三参数（--enforce-eager 等）是用户 args 透传，不在此。片段无空格/特殊字符，直接给
+      GPU 节点 --network host + 内引号 `--gpus '"device=0,1"'`，CPU-only 节点
+      -p {port}:{port} + 空串）；CPU 三参数（--enforce-eager 等）是用户 args 透传，不在此。
+      注记：**GPU 分支含引号结构**——gpus_args 为 `--gpus '"device=X"'` 内引号版，
+      render 经 shlex.split 后 argv 值含字面双引号 `"device=X"`（nvidia 官方多卡
+      workaround，tp>1 双卡识别；单卡行为不变）
     - args 花括号（S2）**无需转义**：str.format 不解析替换值中的 `{`/`}`（原样输出）；
       含空格 token 由 shlex.join 引号包裹 → shlex.split 正确还原（如
       `{"max_tokens": 10}` 保持单 argv）；在值中做 `{`→`{{` 转义反而会输出双花括号

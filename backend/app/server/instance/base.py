@@ -96,7 +96,9 @@ def apply_report(
     - new_state：取上报值，但受 M2 stopped 防复活守卫拦截（见下）。
     - target_state：仅当 is_target_achieved(reported_state, 当前 target) 成立时清回 none，
       否则保留——防 stop/start 在途期间被中途上报（仍带旧 state）清掉 target（B1 竞态）。
-    - state_message：上报非 None 才更新，否则保留（防缺省上报抹掉已存错误信息）。
+    - state_message：上报非 None → 更新；**上报 None 且状态发生转换（reported_state !=
+      current_state）→ 清空**（防旧错误文案残留到新状态）；**无转换（如 running→running）
+      即使上报 None 也保留**（保护 D8「人工介入」等悬挂文案）。
     - port/restart_count：仅上报非 None 时更新，否则保留原值。
 
     M2 守卫（stopped 终态防复活）：无目标意图（target=none）时，已 stopped 实例不接受
@@ -127,7 +129,7 @@ def apply_report(
         new_target,
         reported_state_message
         if reported_state_message is not None
-        else state_message,
+        else (None if reported_state != current_state else state_message),
         reported_port if reported_port is not None else port,
         reported_restart_count
         if reported_restart_count is not None

@@ -329,3 +329,84 @@ worker 侧已有两处正确降级（无需改）：`_check_vram`（pynvml 不�
 > 决策「node 删除 = 存活守卫（READY/UNREACHABLE 心跳宽限内 409）+ 级联删 stopped
 > 实例」已在 `docs/worker-contract.md` §1.4 契约化（代码随 Lane R 落地）；PENDING 节点
 > 超时规则与 pin 广播裁剪本期不做（文档化，见 deepwork 进度文件）。
+
+---
+
+## 8. A800 真实 GPU 集成测试结论（2×A800）
+
+> 来源：`.slim/deepwork/local-integration-testing.md`「续：A800 真实 GPU 集成测试」
+> （2026-09-24，G1–G4 全量执行）。部署 runbook 见 `docs/a800-worker-deploy.md`（已有，
+> 此处不重复）；本节只沉淀**验证结论 / 产品 bug / 记账缺口决策 / 运维注记**。
+
+### 8.1 环境与部署摘要
+
+| 项 | 值 |
+|---|---|
+| 靶机 | `10.1.251.230`（主机名 master，Ubuntu 5.15）；**2×NVIDIA A800 80GB PCIe**（index 0/1） |
+| 运行时 | docker 26.0.2；镜像 harbor `vllm/vllm-openai:v0.26.0`（ENTRYPOINT=vllm serve，匹配 A1 契约）；模型 `/nfsdata/models/Qwen/Qwen3-0.6B`（1.5G） |
+| 连通性 | A800 直连本机不通（VPN 单向）→ **SSH 反向隧道** `ssh -N -R 8000:127.0.0.1:8000`；worker `SERVER_URL=http://127.0.0.1:8000`，server→worker 直连 `10.1.251.230:8100`（ADVERTISE 生效，healthz 200） |
+| Python | **python3.11.16 venv**（系统 3.10.12 被 `base_enum.py` 的 `StrEnum` 阻塞 → 换环境，零代码改动）；补装 nvidia-ml-py |
+| 部署/重启命令 | 详见 `docs/a800-worker-deploy.md`（§4 worker env、§7 注意事项）；代码/venv 落 `/nfsdata` |
+
+### 8.2 验证结论（GPU 版场景矩阵）
+
+> 编号沿用 §7；CPU 已覆盖场景此处只列 GPU 版差异与关键值。
+
+| 域 | 场景 | 结果与关键值 |
+|---|---|---|
+| B | 注册幂等 | 通过：重启重复注册 → 同 node_id/token 不变，不新增节点 |
+| B | 状态监控 | 通过：accelerator=gpu、gpu_devices **真实 2×A800**（GPU0 used 57.7G=kronos / GPU1 0.75G）、memory_total=85899345920/卡 |
+| B | 鉴权 | 通过：错误 token→401；跨节点 token→403；/healthz 免鉴权 200 |
+| B | 掉线时间线 | 通过：kill worker → +19s unreachable → +34s offline → 重启 +11s ready（隧道独立不受影响） |
+| C | 单卡成功 | 通过：GMU 0.2 → `gpu_indexes=[0]`、`allocated_vram={0:16GiB}`（≤ GPU0 空闲 23.7G） |
+| C | **缺口实证** | 通过：24GiB claim → allocator 账面通过（两卡都当 80G 全空）→ worker pynvml `_check_vram` 拒启 **error「显存不足：目标卡空闲显存 < 需求 25769803776 Bytes（卡 [0]）」**；GPU1 全空也不换卡（first-fit 恒选 GPU0） |
+| C | tp=2 分组 | 通过：真实双卡 `[0,1]` |
+| C | 拒绝路径 | 通过：tp=2 双记录 / gmu=1.5 / vram_claim=0 / 80GiB+gmu0.9「超单卡上限」pin 真实验证 / is_active=false → 400，reason 符合预期 |
+| C | 并发 create | 通过：双 200 **账面 Σ=32GiB 不超**（GPU0 实际空余 23.7G 的差异记录，防超卖由 worker 启动兜底） |
+| D | 全链路创建 | 通过：**子目录模型名** `Qwen/Qwen3-0.6B` create → running，首启 torch.compile **25.39s**（阈值 40/240 余量充足） |
+| D | 推理冒烟 | 通过：Mac 直连 `/v1/models` 200 + chat/completions 返回内容（真实 GPU） |
+| D | stop 收敛 | 通过：~5s 收敛 stopped |
+| D | 再启动 | 通过：71s 回 running（compile 缓存） |
+| D | error 清理 | 通过：非法 flag → error → stop → delete；D5 占 GPU0 16G 后可用率 80%<90% → **first-fit 落 GPU1（记账动态正确）** |
+| D | delete | 通过：docker 0 残留 |
+| D | 自愈 | 通过：docker kill → 16s error → delay-0 重启（**restart_count=1**）→ running |
+| D | 失联+恢复 | 通过：kill worker → 实例 unreachable → 重启 restore → ready ≤15s → running **保 port**（meta 落 `/nfsdata` worker 日志目录） |
+| D | 空快照对账 | 通过：全程无异常 |
+
+> 环境事件（非 bug）：D1 期间隧道被远端关闭 → 实例冻结 starting → 重建隧道即恢复
+> （Gate G1 条件 2「断线→冻结→恢复自愈」实测成立）。
+
+### 8.3 发现并修复的产品 bug
+
+> 三处修复均在 working tree（未 commit，G4 收口统一提交）；已带契约测试与文档同步。
+
+| Bug | 级别 | 修复 | 验证 |
+|---|---|---|---|
+| `resolve_model_path` 子目录模型名 404→500（权重广播全失败） | **P1** | `path = name if name.is_absolute() else model_root / model_name`（相对名一律拼 root，`process_utils.py:80`；`..` 穿越由 S6 根外校验兜底，只读注记不加守卫） | A800 实测 `Qwen/Qwen3-0.6B` weight **404→200**（weight_bytes=1503300328 精确）；契约测试 subdir_join/root_escape + worker-contract §6 同步 |
+| `--gpus device=1,0` 多卡只挂首卡 → tp>1 必败（World size(2)>GPUs(1)） | **P1** | 内引号版 `--gpus '"device=1,0"'`（NVIDIA 官方多卡 workaround；渲染走 shlex.split，argv 含字面双引号；模板常量/防漂移测试无需改，`lifecycle.py:300`） | A800 实测：容器内 `nvidia-smi -L` **2 卡** + **tp=2 running**；单卡回归（`"device=0"` 引号版）仍跑通 |
+| apply_report 恢复后残留「节点失联」文案（展示滞后） | **P2 UX** | **状态转换**（reported≠current）且上报 msg None → 清 msg；无转换即使 None 也保留（`base.py:apply_report`） | 契约测试：B7 转换清 ✓；D8（running→running）不清 ✓（四元组「人工介入」不破坏） |
+
+### 8.4 allocator 记账缺口（两种形式）与决策
+
+**缺口实证（两种形式）**：
+
+- **(a) 外部显存占用不消费**：`available = total − Σallocated − system_reserved` **不扣 `memory_used`**——kronos 占 GPU0 57G 仍按 80G 全空 → 24GiB claim 账面通过、worker 拒启 error；GPU1 空也不换卡（first-fit 恒选 GPU0）。
+- **(b) GMU 配额 ≠ 实际占用**：Qwen3-0.6B 实际 ~2-3G ≪ 配额；并发双实例 + D7 同场共 3 实例 → GPU0 used 77028MiB / free 4125MiB → vLLM Engine init 失败 error（**自身 OOM 兜底，无炸机**；账面 Σ48G≤80G vs 真实逼近极限形成对照）。
+
+**gpustack 对照结论**：记账模型**同构**——`allocatable_vram = total − Σallocated(实例绑定) − system_reserved`（policies/utils.py），`memory.used` **零调度消费**（K8s NodeInfo 模式，刻意排除节点自报状态：陈旧性/双重计数/外部不可控）；外部占用靠 `system_reserved` 配置 + GMU 0.9 余量；且 **gpustack 无 worker 端启动时刻 pynvml 硬校验（本项目更严）**。
+
+**用户决策（方案 A：维持现状）**：
+
+- 与 gpustack 同构（记账 + reserved + worker 启动硬校验已更严），**不照搬「消费 memory_used」**（无先例 + 三重风险）。
+- kronos 类单卡外部占用用 **`WORKER_SYSTEM_RESERVED_VRAM` 配置预留**缓解（零代码）——**注意：整机级每卡都扣，单卡被占场景作用有限**（此处注明）。
+- worker 端 pynvml `_check_vram` **启动时刻硬校验是兜底边界**（启动时刻快照，**不覆盖运行期渐进占用**——实例运行中被外部挤占仍需人工介入）。
+
+### 8.5 运维注记
+
+| 项 | 状态 |
+|---|---|
+| `gemma4-26b-a4b` | 已停（Exited 0，**用户决策不恢复**）；GPU1 释放 73163→0 MiB |
+| master 节点记录 | **保留**（offline，非 delete） |
+| A800 部署产物 | `/nfsdata/vllm_manager/` 代码 + venv + miniconda 保留供复用；重启命令见 `a800-worker-deploy.md` §4 |
+| 收尾还原 | A800 worker + 隧道已停；本地 server 回 `127.0.0.1:8000`、CPU worker 恢复（ready）；A800 侧 vllm- 容器 0、他人容器未动 |
+| 隧道依赖 | 重启本机后需重建 `ssh -N -R 8000:127.0.0.1:8000`（带 ServerAlive 参数）；私钥 `~/.ssh/a800_ed25519` 仅本机使用，**禁止入库** |

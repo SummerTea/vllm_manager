@@ -103,6 +103,31 @@ def test_resolve_model_path_not_found(tmp_path):
         resolve_model_path(tmp_path, "not-exist")
 
 
+def test_resolve_model_path_subdir_join(tmp_path):
+    """子目录式相对名（Qwen/Qwen3-0.6B）→ 拼 model_root 子目录，而非当 CWD 相对直用。
+
+    G2 回归：含 `/` 的相对名此前被直用导致 404（权重广播全失败 → create 500）。
+    """
+    d = tmp_path / "models" / "Qwen" / "Qwen3-0.6B"
+    d.mkdir(parents=True)
+    assert resolve_model_path(tmp_path / "models", "Qwen/Qwen3-0.6B") == d
+
+
+def test_resolve_model_path_root_escape_not_under_root(tmp_path):
+    """`..` 穿越定位断言：`Qwen/../../outside` 解析到 root 外（目标目录存在时返回）。
+
+    注记：start 路径由 S6 根外校验兜底拒启；weight 路径为只读扫描不防（P3 信息
+    暴露级，不另加守卫）。此处仅断言解析位置，不调用 start/weight。
+    """
+    root = tmp_path / "models"
+    root.mkdir()
+    (root / "Qwen").mkdir()  # 中间目录须存在（POSIX `..` 需可遍历）
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    resolved = resolve_model_path(root, "Qwen/../../outside")
+    assert not resolved.resolve().is_relative_to(root.resolve())
+
+
 # ---------- 命令组装 ----------
 
 
@@ -209,15 +234,19 @@ def _render_cmd_with(
 
 
 def _render_cmd(tmp_path: Path) -> list[str]:
-    """按 lifecycle._launch_container 同构组装默认模板渲染结果（GPU 路径）。"""
-    return _render_cmd_with(tmp_path, "0,1", "--network host", "--gpus device=0,1")
+    """按 lifecycle._launch_container 同构组装默认模板渲染结果（GPU 路径）。
+
+    gpus_args 为内引号版（渲染后 argv 值含字面双引号，nvidia 多卡 workaround）。
+    """
+    return _render_cmd_with(tmp_path, "0,1", "--network host", "--gpus '\"device=0,1\"'")
 
 
 # ---------- 结构性网络/GPU 差异片段 ----------
 
 
 def test_build_context_net_gpu_fragments():
-    """build_context 派生片段透传：GPU（gpu_indexes 非空串）与 CPU（空串）两路。"""
+    """build_context 派生片段透传：GPU（gpu_indexes 非空串，gpus_args 内引号版）
+    与 CPU（空串）两路。"""
     ctx = build_context(
         name="vllm-i-1",
         image="img",
@@ -226,14 +255,14 @@ def test_build_context_net_gpu_fragments():
         port="18080",
         gpu_indexes="0,1",
         net_args="--network host",
-        gpus_args="--gpus device=0,1",
+        gpus_args="--gpus '\"device=0,1\"'",
         shm_size="10g",
         args_fragment="",
         env_args="",
         mount_args="",
     )
     assert ctx["net_args"] == "--network host"
-    assert ctx["gpus_args"] == "--gpus device=0,1"
+    assert ctx["gpus_args"] == "--gpus '\"device=0,1\"'"
 
     ctx_cpu = build_context(
         name="vllm-i-1",
@@ -254,10 +283,22 @@ def test_build_context_net_gpu_fragments():
 
 
 def test_render_docker_command_gpu_fragments(tmp_path):
-    """GPU 渲染：含 --network host 与 --gpus device=，与现行为 token 等价。"""
-    cmd = _render_cmd_with(tmp_path, "0,1", "--network host", "--gpus device=0,1")
+    """GPU 渲染：含 --network host 与内引号 --gpus '"device=0,1"'，argv 值带字面引号。"""
+    cmd = _render_cmd_with(tmp_path, "0,1", "--network host", "--gpus '\"device=0,1\"'")
     assert cmd[cmd.index("--network") + 1] == "host"
-    assert cmd[cmd.index("--gpus") + 1] == "device=0,1"
+    assert cmd[cmd.index("--gpus") + 1] == '"device=0,1"'
+
+
+def test_render_docker_command_tp2_gpus_quoted(tmp_path):
+    """G3：tp=2 双卡渲染 → shlex.split 后 argv 含 ['--gpus', '"device=1,0"']。
+
+    nvidia 官方多卡 workaround：--gpus 值须带字面双引号，docker CLI 才按
+    '"device=1,0"' 解析两卡；直接传 device=1,0（无引号）多卡场景识别失败。
+    """
+    cmd = _render_cmd_with(
+        tmp_path, "1,0", "--network host", "--gpus '\"device=1,0\"'"
+    )
+    assert cmd[cmd.index("--gpus") + 1] == '"device=1,0"'
 
 
 def test_render_docker_command_cpu_fragments(tmp_path):
@@ -320,7 +361,7 @@ def test_render_docker_command_default_template(tmp_path):
     assert cmd[cmd.index("--name") + 1] == "vllm-i-1"
     assert cmd[cmd.index("--network") + 1] == "host"
     assert cmd[cmd.index("--shm-size") + 1] == "10g"
-    assert cmd[cmd.index("--gpus") + 1] == "device=0,1"
+    assert cmd[cmd.index("--gpus") + 1] == '"device=0,1"'
     assert "vllm/vllm-openai:latest" in cmd
     assert "serve" not in cmd  # A1：镜像 ENTRYPOINT 承担 vllm serve
     model_dir = str(tmp_path / "models" / "qwen2.5")

@@ -245,6 +245,36 @@ def test_apply_report_keeps_state_message_when_not_reported():
     assert new_message == "新信息"
 
 
+def test_apply_report_clears_message_on_state_transition():
+    """观察③：状态发生转换（reported_state != current_state）且上报 msg None → 清空旧文案。
+
+    典型：实例失联置 unreachable（msg=节点失联）→ worker 恢复上报 running（msg None）
+    → 旧「节点失联」不应残留到 running 态。
+    """
+    _, _, new_message, _, _ = apply_report(
+        "unreachable", "none", "节点失联", None, 0, "running", None, None, None
+    )
+    assert new_message is None
+    # error → running 同样清
+    _, _, new_message, _, _ = apply_report(
+        "error", "none", "docker run 进程已退出（code=2）", None, 0, "running", None, None, None
+    )
+    assert new_message is None
+
+
+def test_apply_report_keeps_message_on_no_transition():
+    """观察③ 反向保护：状态未转换（running→running）且上报 msg None → 保留原文案。
+
+    保护 D8「人工介入」等悬挂文案：stop 在途 worker 持续上报 running（msg None）
+    不得抹掉「停止指令多次未生效，需人工介入」。
+    """
+    _, _, new_message, _, _ = apply_report(
+        "running", "stopping", "停止指令多次未生效，需人工介入", None, 0,
+        "running", None, None, None,
+    )
+    assert new_message == "停止指令多次未生效，需人工介入"
+
+
 # ---------- M2 stopped 防复活守卫 ----------
 
 
