@@ -1,0 +1,294 @@
+from datetime import date as Date
+from typing import List, Optional
+
+from pydantic import BaseModel, Field, computed_field, field_validator
+
+from gpustack.api.exceptions import InvalidException
+from gpustack.schemas.common import Pagination
+
+
+USAGE_METRIC_INPUT_TOKENS = "input_tokens"
+USAGE_METRIC_OUTPUT_TOKENS = "output_tokens"
+USAGE_METRIC_INPUT_CACHED_TOKENS = "input_cached_tokens"
+USAGE_METRIC_TOTAL_TOKENS = "total_tokens"
+USAGE_METRIC_API_REQUESTS = "api_requests"
+USAGE_METRIC_MODELS_CALLED = "models_called"
+USAGE_METRIC_API_KEYS_USED = "api_keys_used"
+USAGE_METRIC_AVG_TOKENS_PER_REQUEST = "avg_tokens_per_request"
+USAGE_METRIC_LAST_ACTIVE = "last_active"
+USAGE_METRIC_DATE = "date"
+
+USAGE_GROUP_BY_DATE = "date"
+USAGE_GROUP_BY_USER = "user"
+USAGE_GROUP_BY_API_KEY = "api_key"
+USAGE_GROUP_BY_ROUTE = "route"
+# Groups by the consumer principal (``consumer_principal_id`` — the
+# API-key owner Org). Reserved for the platform-wide "All" view (admin
+# in cross-org context); enforced in the route handler.
+USAGE_GROUP_BY_ORGANIZATION = "organization"
+
+USAGE_GRANULARITY_DAY = "day"
+USAGE_GRANULARITY_WEEK = "week"
+USAGE_GRANULARITY_MONTH = "month"
+
+USAGE_SORT_ASC = "asc"
+USAGE_SORT_DESC = "desc"
+
+# Usage view scope. ``self`` filters to the caller's own rows
+# (``user_id = self``); ``all`` filters to the current Org's rows
+# (``owner_principal_id = current_principal_id``), or — for platform admin in
+# cross-org context — to every Org. ``all`` is reserved for admin /
+# Org owner / manager; others are forced to ``self``.
+USAGE_SCOPE_SELF = "self"
+USAGE_SCOPE_ALL = "all"
+USAGE_SCOPES = {USAGE_SCOPE_SELF, USAGE_SCOPE_ALL}
+
+USAGE_GROUP_BYS = {
+    USAGE_GROUP_BY_DATE,
+    USAGE_GROUP_BY_USER,
+    USAGE_GROUP_BY_API_KEY,
+    USAGE_GROUP_BY_ROUTE,
+    USAGE_GROUP_BY_ORGANIZATION,
+}
+USAGE_GRANULARITIES = {
+    USAGE_GRANULARITY_DAY,
+    USAGE_GRANULARITY_WEEK,
+    USAGE_GRANULARITY_MONTH,
+}
+USAGE_SORTABLE_FIELDS = {
+    USAGE_METRIC_INPUT_TOKENS,
+    USAGE_METRIC_OUTPUT_TOKENS,
+    USAGE_METRIC_INPUT_CACHED_TOKENS,
+    USAGE_METRIC_TOTAL_TOKENS,
+    USAGE_METRIC_API_REQUESTS,
+    USAGE_METRIC_AVG_TOKENS_PER_REQUEST,
+    USAGE_METRIC_MODELS_CALLED,
+    USAGE_METRIC_API_KEYS_USED,
+    USAGE_METRIC_LAST_ACTIVE,
+    USAGE_METRIC_DATE,
+}
+
+
+class UsageOption(BaseModel):
+    key: str
+    label: str
+
+
+class UsageIdentityValue(BaseModel):
+    user_name: Optional[str] = None
+    api_key_name: Optional[str] = None
+    access_key: Optional[str] = None
+    api_key_is_custom: Optional[bool] = None
+    route_name: Optional[str] = None
+    # ``organization_name`` — consumer Org display name (snapshotted on
+    # model_usages at ingest, with a live fallback for pre-upgrade rows);
+    # ``organization_kind`` — the consumer principal's kind (``org`` / ``user``
+    # / ``group``) so the client can tag a personal (USER) row; ``group_name``
+    # — user-group display name (filter-only dimension).
+    organization_name: Optional[str] = None
+    organization_kind: Optional[str] = None
+    group_name: Optional[str] = None
+
+
+class UsageIdentityCurrent(BaseModel):
+    user_id: Optional[int] = None
+    api_key_id: Optional[int] = None
+    route_id: Optional[int] = None
+    organization_id: Optional[int] = None
+    group_id: Optional[int] = None
+
+
+class UsageIdentity(BaseModel):
+    value: UsageIdentityValue
+    current: Optional[UsageIdentityCurrent] = None
+
+
+class UsageFilterItem(BaseModel):
+    identity: UsageIdentity
+
+
+class UsageFilterOption(UsageFilterItem):
+    label: str
+    deleted: bool
+
+
+class UsageFilters(BaseModel):
+    users: List[UsageFilterOption] = Field(default_factory=list)
+    api_keys: List[UsageFilterOption] = Field(default_factory=list)
+    routes: List[UsageFilterOption] = Field(default_factory=list)
+    # Platform-wide "All" view only. ``organizations`` — consumer Orgs
+    # with usage; ``user_groups`` — groups whose members can be filtered on.
+    organizations: List[UsageFilterOption] = Field(default_factory=list)
+    user_groups: List[UsageFilterOption] = Field(default_factory=list)
+
+
+class UsageMetaResponse(BaseModel):
+    metrics: List[UsageOption]
+    granularities: List[UsageOption]
+    group_bys: List[UsageOption]
+    filters: UsageFilters
+
+
+class UsageFilterRequest(BaseModel):
+    users: List[UsageFilterItem] = Field(default_factory=list)
+    api_keys: List[UsageFilterItem] = Field(default_factory=list)
+    routes: List[UsageFilterItem] = Field(default_factory=list)
+    # Consumer-Org filter (``consumer_principal_id``) and user-group
+    # filter (expanded to the group's direct USER members). Both are
+    # platform-admin-only; enforced in the route handler.
+    organizations: List[UsageFilterItem] = Field(default_factory=list)
+    user_groups: List[UsageFilterItem] = Field(default_factory=list)
+
+
+class UsageBaseRequest(BaseModel):
+    start_date: Date
+    end_date: Date
+    filters: UsageFilterRequest = Field(default_factory=UsageFilterRequest)
+    # See USAGE_SCOPE_* constants. Defaults to "all" so that managers /
+    # admins who omit the parameter get the org-wide view; the endpoint
+    # downgrades to "self" automatically when the caller has no
+    # managerial role (and rejects the request if they explicitly
+    # asked for "all").
+    scope: str = USAGE_SCOPE_ALL
+
+    @field_validator("end_date")
+    @classmethod
+    def validate_date_range(cls, value: Date, info) -> Date:
+        start_date = info.data.get("start_date")
+        if start_date and value < start_date:
+            raise ValueError("end_date must be on or after start_date")
+        return value
+
+    @field_validator("scope")
+    @classmethod
+    def validate_scope(cls, value: str) -> str:
+        if value not in USAGE_SCOPES:
+            raise ValueError(f"Unsupported scope: {value}")
+        return value
+
+
+class UsageBreakdownRequest(UsageBaseRequest):
+    group_by: List[str]
+    granularity: Optional[str] = None
+    sort_by: Optional[str] = f"-{USAGE_METRIC_TOTAL_TOKENS}"
+    page: int = 1
+    perPage: int = 20
+
+    @field_validator("group_by")
+    @classmethod
+    def validate_group_by(cls, value: List[str]) -> List[str]:
+        if not value:
+            raise ValueError("group_by must not be empty")
+        unsupported = [item for item in value if item not in USAGE_GROUP_BYS]
+        if unsupported:
+            raise ValueError(f"Unsupported group_by: {', '.join(unsupported)}")
+        if len(value) != len(set(value)):
+            raise ValueError("group_by must not contain duplicate values")
+        return value
+
+    @field_validator("granularity")
+    @classmethod
+    def validate_granularity(cls, value: Optional[str]) -> Optional[str]:
+        if value is not None and value not in USAGE_GRANULARITIES:
+            raise ValueError(f"Unsupported granularity: {value}")
+        return value
+
+    @field_validator("sort_by")
+    @classmethod
+    def validate_sort_by(cls, value: Optional[str]) -> Optional[str]:
+        if not value:
+            return value
+        for field in value.split(","):
+            field = field.strip()
+            if not field:
+                continue
+            field_name = field[1:] if field.startswith("-") else field
+            if field_name not in USAGE_SORTABLE_FIELDS:
+                raise InvalidException(
+                    f"Field '{field_name}' is not sortable. "
+                    f"Allowed fields: {', '.join(sorted(USAGE_SORTABLE_FIELDS))}"
+                )
+        return value
+
+    @field_validator("perPage")
+    @classmethod
+    def validate_per_page(cls, value: int) -> int:
+        # Generous ceiling (abuse cap only). Kept at 10000 for backward compat
+        # with older UIs that fetch the whole set via perPage=10000; new callers
+        # use page=-1. Lowering it would 400 cached old UIs on upgrade.
+        if value < 1 or value > 10000:
+            raise ValueError("perPage must be between 1 and 10000")
+        return value
+
+    @field_validator("page")
+    @classmethod
+    def validate_page(cls, value: int) -> int:
+        # ``-1`` is the no-pagination sentinel (return all buckets); otherwise a
+        # positive page. Reject 0 and any other negative so a stray value can't
+        # slip through as "no pagination" and get echoed back as a bogus
+        # ``pagination.page`` (e.g. "page -42 of 1").
+        if value != -1 and value < 1:
+            raise ValueError("page must be a positive number or -1 (no pagination)")
+        return value
+
+    @computed_field
+    @property
+    def order_by(self) -> List[tuple[str, str]]:
+        if not self.sort_by:
+            return []
+        order_by = []
+        for field in self.sort_by.split(","):
+            field = field.strip()
+            if not field:
+                continue
+            if field.startswith("-"):
+                order_by.append((field[1:], USAGE_SORT_DESC))
+            else:
+                order_by.append((field, USAGE_SORT_ASC))
+        return order_by
+
+
+class UsageSummary(BaseModel):
+    input_tokens: int = 0
+    output_tokens: int = 0
+    input_cached_tokens: int = 0
+    total_tokens: int = 0
+    api_requests: int = 0
+    models_called: int = 0
+
+
+class UsageBreakdownDimension(BaseModel):
+    identity: Optional[UsageIdentity] = None
+    label: str
+    deleted: bool
+
+
+class UsageBreakdownDateDimension(BaseModel):
+    value: Date
+    label: str
+    deleted: bool = False
+
+
+class UsageBreakdownItem(BaseModel):
+    date: Optional[UsageBreakdownDateDimension] = None
+    user: Optional[UsageBreakdownDimension] = None
+    api_key: Optional[UsageBreakdownDimension] = None
+    route: Optional[UsageBreakdownDimension] = None
+    organization: Optional[UsageBreakdownDimension] = None
+    input_tokens: int = 0
+    output_tokens: int = 0
+    input_cached_tokens: int = 0
+    total_tokens: int = 0
+    api_requests: int = 0
+    avg_tokens_per_request: float = 0
+    models_called: Optional[int] = None
+    api_keys_used: Optional[int] = None
+    last_active: Optional[Date] = None
+
+
+class UsageBreakdownResponse(BaseModel):
+    summary: UsageSummary
+    group_by: List[str]
+    granularity: Optional[str] = None
+    pagination: Pagination
+    items: List[UsageBreakdownItem]

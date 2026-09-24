@@ -36,7 +36,16 @@ frontend/dist/
 
 # BEGIN oh-my-opencode-slim clonedeps
 .slim/clonedeps/repos/
+# 锁定 gpustack v2.2.3 参考源码（版本清单见 .slim/clonedeps.json）——仅源码入库，排除内部 .git
+!.slim/clonedeps/repos/
+!.slim/clonedeps/repos/gpustack__gpustack/
+!.slim/clonedeps/repos/gpustack__gpustack/**
+.slim/clonedeps/repos/gpustack__gpustack/.git/
+.slim/clonedeps/repos/gpustack__gpustack/.git/**
 # END oh-my-opencode-slim clonedeps
 
 # Deepwork 进度文件（git-local，OpenCode 可读）
 .slim/deepwork/
+
+# OpenCode 本地配置与依赖（.opencode/node_modules 等）
+.opencode/
