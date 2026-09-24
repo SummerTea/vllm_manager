@@ -176,7 +176,7 @@ worker 侧已有两处正确降级（无需改）：`_check_vram`（pynvml 不�
   → 状态上报（status.accelerator=cpu 显式声明）
   → 创建实例（allocator CPU 分支分配 gpu_indexes=[]）
   → worker 渲染 CPU 模板（无 --gpus、-p 端口映射）
-  → docker run 拉起 qwen3-0.6B（float32 + enforce-eager + max-model-len 4096 走 args）
+  → docker run 拉起 qwen3-0.6B（float32 + enforce-eager + max-model-len 2048 走 args）
   → 健康检查（worker 探宿主机 127.0.0.1:{port}/v1/models → 200 → running）
   → /instances/report 对账 → server 收敛 running
   → stop → docker stop/kill/rm → report 消失 → 收敛 stopped
@@ -212,6 +212,24 @@ worker 侧已有两处正确降级（无需改）：`_check_vram`（pynvml 不�
     ```
 
    （§4 关键参数经 `args` 透传；`tensor_parallel_size` 保持 1——CPU 分支 tp>1 拒绝。）
+
+> **集成测试定位（vLLM 最小参数启动即可）**：本机 CPU 集成测试的目标是**验证
+> vllm_manager 管理链路闭环**（注册 → 创建 → 启动 → 健康检查 → 对账 → 停止），
+> **不是 vLLM 推理性能/能力测试**。因此 vLLM **只须以最小参数启动、能响应
+> `/v1/models` 与一次推理即可**，无需调优推理质量参数（`--temperature`/
+> `--repetition-penalty`/`--max-num-seqs` 等一律不传，走 vLLM 默认值）。
+>
+> 上表 create 示例中的 4 个参数是**为让 8GiB CPU 跑通而必须的最小集**，逐个说明：
+>
+> | 参数 | 为什么必须 |
+> |---|---|
+> | `--enforce-eager` | 跳过 torch.compile（arm64 CPU 上编译会卡死，§4 坑 3） |
+> | `--dtype float32` | bf16 在 arm64 oneDNN 无法建 matmul primitive，推理 500（§4 坑 5） |
+> | `--max-model-len 2048` | 压缩 KV cache 需求到 ~0.44GiB（默认 40960 需 4.38GiB 超内存） |
+> | `--gpu-memory-utilization 0.65` | CPU 后端视其为 CPU 内存保留比例（KV 公式见下），升到可行窗口内才能启动 |
+>
+> 除这 4 个外**不要额外加参数**——集成测试验证的是平台链路与状态机，vLLM 侧
+> 保持最小启动即可；推理质量参数属于模型服务调优，不属于本测试范围。
 
 > **CPU 内存预算（P1-2，第四轮实测定稿）**：CPU 后端把 `--gpu-memory-utilization`
 > （GMU）解释为 **CPU 内存保留比例**（非显存），且 KV cache 校验公式为
